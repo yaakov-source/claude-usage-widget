@@ -1,0 +1,645 @@
+// ClaudeUsageBar — a macOS menu bar gauge for Claude plan usage.
+//
+// Menu bar shows a battery-style meter for whichever limit is closest to its
+// cap. Click for a popover with one row per limit, matching the desktop app's
+// "Plan usage limits" panel.
+//
+// Data: GET https://api.anthropic.com/api/oauth/usage
+// Auth: the OAuth token Claude Code stores in the login Keychain under the
+//       service "Claude Code-credentials" (key claudeAiOauth.accessToken).
+
+import AppKit
+import Foundation
+
+// MARK: - Configuration
+
+let kKeychainServices = ["Claude Code-credentials", "Claude Code"]
+let kCredentialFile = NSString(string: "~/.claude/.credentials.json").expandingTildeInPath
+
+let kUsageURL = "https://api.anthropic.com/api/oauth/usage"
+let kProfileURL = "https://api.anthropic.com/api/oauth/profile"
+
+let kRefreshInterval: TimeInterval = 300  // 5 minutes
+
+// MARK: - Model
+
+struct Limit {
+    let title: String
+    let fraction: Double      // 0...1
+    let resets: Date?
+    let severity: String      // normal | warning | critical
+    let isActive: Bool
+}
+
+enum FetchState {
+    case loading
+    case ok(limits: [Limit], plan: String?)
+    case noCredentials
+    case expired
+    case httpError(code: Int, message: String)
+    case networkError(String)
+    case unparseable(String)
+}
+
+// MARK: - Credentials
+
+func readOAuthToken() -> String? {
+    var raw: String? = nil
+
+    for service in kKeychainServices {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        task.arguments = ["find-generic-password", "-s", service, "-w"]
+        let out = Pipe()
+        task.standardOutput = out
+        task.standardError = Pipe()
+        do { try task.run() } catch { continue }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { continue }
+        guard var s = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !s.isEmpty else { continue }
+
+        // `security` prints hex when the blob isn't printable text.
+        if !s.hasPrefix("{"),
+           s.count % 2 == 0,
+           s.range(of: "^[0-9a-fA-F]+$", options: .regularExpression) != nil {
+            var bytes = [UInt8]()
+            var idx = s.startIndex
+            while idx < s.endIndex {
+                let next = s.index(idx, offsetBy: 2)
+                if let b = UInt8(s[idx..<next], radix: 16) { bytes.append(b) }
+                idx = next
+            }
+            if let decoded = String(bytes: bytes, encoding: .utf8) { s = decoded }
+        }
+
+        if let d = s.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+           let inner = obj["claudeAiOauth"] as? [String: Any],
+           let token = inner["accessToken"] as? String, !token.isEmpty {
+            return token
+        }
+        raw = s
+    }
+
+    if raw == nil, FileManager.default.fileExists(atPath: kCredentialFile) {
+        raw = try? String(contentsOfFile: kCredentialFile, encoding: .utf8)
+    }
+
+    guard let text = raw,
+          let data = text.data(using: .utf8),
+          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    else { return nil }
+
+    if let inner = obj["claudeAiOauth"] as? [String: Any],
+       let token = inner["accessToken"] as? String { return token }
+    if let token = obj["accessToken"] as? String { return token }
+    return nil
+}
+
+// MARK: - Parsing
+
+func parseDate(_ any: Any?) -> Date? {
+    if let n = any as? Double {
+        return Date(timeIntervalSince1970: n > 1e12 ? n / 1000 : n)
+    }
+    guard let s = any as? String, !s.isEmpty else { return nil }
+
+    // API sends 6-digit fractional seconds, which ISO8601DateFormatter
+    // won't always take. Strip them and parse the plain form.
+    let stripped = s.replacingOccurrences(of: "\\.\\d+", with: "",
+                                          options: .regularExpression)
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    if let d = f.date(from: stripped) { return d }
+
+    let f2 = ISO8601DateFormatter()
+    f2.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f2.date(from: s) { return d }
+    return nil
+}
+
+func prettify(_ key: String) -> String {
+    let spaced = key.replacingOccurrences(of: "_", with: " ")
+    return spaced.prefix(1).uppercased() + spaced.dropFirst()
+}
+
+func numeric(_ any: Any?) -> Double? {
+    if let d = any as? Double { return d }
+    if let i = any as? Int { return Double(i) }
+    return nil
+}
+
+/// Reads the documented `limits` array. Falls back to the top-level
+/// five_hour / seven_day objects if the array is ever absent.
+func parseLimits(_ root: Any) -> [Limit] {
+    guard let dict = root as? [String: Any] else { return [] }
+
+    if let arr = dict["limits"] as? [[String: Any]], !arr.isEmpty {
+        var out: [Limit] = []
+        for item in arr {
+            guard let pct = numeric(item["percent"]) else { continue }
+            let kind = item["kind"] as? String ?? ""
+
+            var title: String
+            switch kind {
+            case "session":
+                title = "5-hour limit"
+            case "weekly_all":
+                title = "Weekly · all models"
+            case "weekly_scoped":
+                var name = "scoped"
+                if let scope = item["scope"] as? [String: Any] {
+                    if let model = scope["model"] as? [String: Any],
+                       let dn = model["display_name"] as? String, !dn.isEmpty {
+                        name = dn
+                    } else if let surface = scope["surface"] as? [String: Any],
+                              let dn = surface["display_name"] as? String, !dn.isEmpty {
+                        name = dn
+                    }
+                }
+                title = "Weekly · \(name)"
+            default:
+                title = prettify(kind)
+            }
+
+            out.append(Limit(title: title,
+                             fraction: max(0, min(1, pct / 100)),
+                             resets: parseDate(item["resets_at"]),
+                             severity: item["severity"] as? String ?? "normal",
+                             isActive: item["is_active"] as? Bool ?? false))
+        }
+        if !out.isEmpty { return out }
+    }
+
+    // Fallback shape.
+    var out: [Limit] = []
+    let fallback: [(String, String)] = [
+        ("five_hour", "5-hour limit"),
+        ("seven_day", "Weekly · all models"),
+        ("seven_day_opus", "Weekly · Opus"),
+    ]
+    for (key, title) in fallback {
+        guard let obj = dict[key] as? [String: Any],
+              let pct = numeric(obj["utilization"]) else { continue }
+        out.append(Limit(title: title,
+                         fraction: max(0, min(1, pct / 100)),
+                         resets: parseDate(obj["resets_at"]),
+                         severity: "normal",
+                         isActive: false))
+    }
+    return out
+}
+
+func prettyPlan(_ tier: String?) -> String? {
+    guard let t = tier, !t.isEmpty else { return nil }
+    switch t {
+    case "default_claude_max_20x": return "Max (20x)"
+    case "default_claude_max_5x":  return "Max (5x)"
+    case "default_claude_pro":     return "Pro"
+    default:
+        var s = t
+        s = s.replacingOccurrences(of: "default_", with: "")
+        s = s.replacingOccurrences(of: "claude_", with: "")
+        s = s.replacingOccurrences(of: "_", with: " ")
+        return s.capitalized
+    }
+}
+
+// MARK: - Fetching
+
+final class UsageFetcher {
+    private var planName: String? = nil
+
+    func fetch(completion: @escaping (FetchState) -> Void) {
+        guard let token = readOAuthToken() else {
+            DispatchQueue.main.async { completion(.noCredentials) }
+            return
+        }
+        if planName == nil {
+            fetchProfile(token: token) { [weak self] name in
+                if let n = name { self?.planName = n }
+                self?.fetchUsage(token: token, completion: completion)
+            }
+        } else {
+            fetchUsage(token: token, completion: completion)
+        }
+    }
+
+    private func request(_ urlString: String, token: String,
+                         done: @escaping (Int, Data?, Error?) -> Void) {
+        guard let url = URL(string: urlString) else { done(0, nil, nil); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 20
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("ClaudeUsageBar/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            done(code, data, error)
+        }.resume()
+    }
+
+    private func fetchProfile(token: String, done: @escaping (String?) -> Void) {
+        request(kProfileURL, token: token) { code, data, _ in
+            guard code == 200, let data = data,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let org = obj["organization"] as? [String: Any]
+            else { done(nil); return }
+            done(prettyPlan(org["rate_limit_tier"] as? String))
+        }
+    }
+
+    private func fetchUsage(token: String, completion: @escaping (FetchState) -> Void) {
+        request(kUsageURL, token: token) { [weak self] code, data, error in
+            let finish: (FetchState) -> Void = { s in
+                DispatchQueue.main.async { completion(s) }
+            }
+            if let error = error {
+                finish(.networkError(error.localizedDescription))
+                return
+            }
+            if code == 401 || code == 403 {
+                finish(.expired)
+                return
+            }
+            guard code == 200, let data = data else {
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                finish(.httpError(code: code, message: String(body.prefix(200))))
+                return
+            }
+
+            UsageFetcher.cache(data)
+
+            guard let obj = try? JSONSerialization.jsonObject(with: data) else {
+                finish(.unparseable("Response was not JSON."))
+                return
+            }
+            let limits = parseLimits(obj)
+            if limits.isEmpty {
+                finish(.unparseable("No limits found in the response."))
+                return
+            }
+            finish(.ok(limits: limits, plan: self?.planName))
+        }
+    }
+
+    /// Keeps the last raw response on disk for inspection.
+    static func cache(_ data: Data) {
+        let dir = NSString(string: "~/Library/Application Support/ClaudeUsageBar")
+            .expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir,
+                                                 withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("last-response.json")
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+}
+
+// MARK: - Formatting
+
+func resetText(_ d: Date?) -> String {
+    guard let d = d else { return "" }
+    let delta = d.timeIntervalSinceNow
+    if delta <= 0 { return "Resets soon" }
+    if delta < 24 * 3600 {
+        let total = Int(delta)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        if h > 0 { return "Resets in \(h) hr \(m) min" }
+        return "Resets in \(m) min"
+    }
+    let f = DateFormatter()
+    f.dateFormat = "EEE h:mm a"
+    return "Resets " + f.string(from: d)
+}
+
+func color(for limit: Limit) -> NSColor {
+    switch limit.severity {
+    case "critical": return NSColor.systemRed
+    case "warning":  return NSColor.systemOrange
+    default: break
+    }
+    if limit.fraction >= 0.9 { return NSColor.systemRed }
+    if limit.fraction >= 0.75 { return NSColor.systemOrange }
+    return NSColor.systemBlue
+}
+
+// MARK: - Menu bar gauge
+
+func gaugeImage(fraction: Double?, tint: NSColor) -> NSImage {
+    let w: CGFloat = 25, h: CGFloat = 13
+    let image = NSImage(size: NSSize(width: w, height: h))
+    image.lockFocus()
+
+    let outline = NSColor.labelColor.withAlphaComponent(0.55)
+    let body = NSRect(x: 0.5, y: 1.5, width: w - 4.5, height: h - 3)
+    let bodyPath = NSBezierPath(roundedRect: body, xRadius: 3, yRadius: 3)
+    bodyPath.lineWidth = 1
+    outline.setStroke()
+    bodyPath.stroke()
+
+    let cap = NSBezierPath(roundedRect: NSRect(x: w - 3.2, y: h / 2 - 2,
+                                               width: 2.2, height: 4),
+                           xRadius: 1, yRadius: 1)
+    outline.setFill()
+    cap.fill()
+
+    if let f = fraction {
+        let inner = body.insetBy(dx: 2, dy: 2)
+        let fw = max(0, min(1, f)) * inner.width
+        if fw > 0.75 {
+            let fill = NSBezierPath(roundedRect: NSRect(x: inner.minX, y: inner.minY,
+                                                        width: fw, height: inner.height),
+                                    xRadius: 1.5, yRadius: 1.5)
+            tint.setFill()
+            fill.fill()
+        }
+    } else {
+        let dash = NSBezierPath(rect: NSRect(x: body.midX - 3, y: h / 2 - 0.5,
+                                             width: 6, height: 1))
+        outline.setFill()
+        dash.fill()
+    }
+
+    image.unlockFocus()
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Popover views
+
+final class BarView: NSView {
+    var fraction: Double = 0 { didSet { needsDisplay = true } }
+    var tint: NSColor = .systemBlue { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let h: CGFloat = 6
+        let y = (bounds.height - h) / 2
+        let track = NSBezierPath(roundedRect: NSRect(x: 0, y: y,
+                                                     width: bounds.width, height: h),
+                                 xRadius: h / 2, yRadius: h / 2)
+        NSColor.labelColor.withAlphaComponent(0.12).setFill()
+        track.fill()
+
+        let w = max(0, min(1, fraction)) * bounds.width
+        if w > 1 {
+            let fill = NSBezierPath(roundedRect: NSRect(x: 0, y: y, width: w, height: h),
+                                    xRadius: h / 2, yRadius: h / 2)
+            tint.setFill()
+            fill.fill()
+        }
+    }
+}
+
+final class UsageViewController: NSViewController {
+    private let width: CGFloat = 330
+    private var state: FetchState = .loading
+    var onRefresh: (() -> Void)?
+
+    init() { super.init(nibName: nil, bundle: nil) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 140))
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        rebuild()
+    }
+
+    func update(_ newState: FetchState) {
+        state = newState
+        rebuild()
+    }
+
+    private func makeLabel(_ text: String, size: CGFloat, weight: NSFont.Weight,
+                           tone: NSColor, align: NSTextAlignment = .left) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = NSFont.systemFont(ofSize: size, weight: weight)
+        f.textColor = tone
+        f.alignment = align
+        f.cell?.lineBreakMode = .byTruncatingTail
+        f.cell?.usesSingleLineMode = true
+        return f
+    }
+
+    private func rebuild() {
+        view.subviews.forEach { $0.removeFromSuperview() }
+
+        let pad: CGFloat = 16
+        let contentWidth = width - pad * 2
+        var blocks: [NSView] = []
+
+        var headerText = "Claude usage"
+        if case .ok(_, let plan) = state {
+            headerText = plan.map { "Plan usage limits · \($0)" } ?? "Plan usage limits"
+        }
+        let header = makeLabel(headerText, size: 12, weight: .regular,
+                               tone: NSColor.secondaryLabelColor)
+        header.frame = NSRect(x: 0, y: 0, width: contentWidth, height: 16)
+        blocks.append(header)
+
+        switch state {
+        case .loading:
+            blocks.append(messageBlock("Loading…", width: contentWidth))
+
+        case .noCredentials:
+            blocks.append(messageBlock(
+                "No Claude token found.\nRun `claude` in Terminal and sign in, then refresh.",
+                width: contentWidth))
+
+        case .expired:
+            blocks.append(messageBlock(
+                "Token expired.\nRun `claude` in Terminal once to refresh it, then refresh here.",
+                width: contentWidth))
+
+        case .httpError(let code, let message):
+            blocks.append(messageBlock("HTTP \(code)\n\(message)", width: contentWidth))
+
+        case .networkError(let message):
+            blocks.append(messageBlock("Network error\n\(message)", width: contentWidth))
+
+        case .unparseable(let message):
+            blocks.append(messageBlock(
+                "\(message)\nRaw response saved to ~/Library/Application Support/ClaudeUsageBar/",
+                width: contentWidth))
+
+        case .ok(let limits, _):
+            for limit in limits {
+                blocks.append(limitBlock(limit, width: contentWidth))
+            }
+        }
+
+        let footer = NSView(frame: NSRect(x: 0, y: 0, width: contentWidth, height: 22))
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshTapped))
+        refresh.bezelStyle = .inline
+        refresh.controlSize = .small
+        refresh.font = NSFont.systemFont(ofSize: 11)
+        refresh.sizeToFit()
+        refresh.frame = NSRect(x: 0, y: 0, width: max(62, refresh.frame.width), height: 20)
+        footer.addSubview(refresh)
+
+        let quit = NSButton(title: "Quit", target: self, action: #selector(quitTapped))
+        quit.bezelStyle = .inline
+        quit.controlSize = .small
+        quit.font = NSFont.systemFont(ofSize: 11)
+        quit.sizeToFit()
+        let qw = max(50, quit.frame.width)
+        quit.frame = NSRect(x: contentWidth - qw, y: 0, width: qw, height: 20)
+        footer.addSubview(quit)
+        blocks.append(footer)
+
+        var total: CGFloat = pad * 2
+        for (i, b) in blocks.enumerated() {
+            total += b.frame.height
+            if i > 0 { total += 12 }
+        }
+
+        view.frame = NSRect(x: 0, y: 0, width: width, height: total)
+        var y = total - pad
+        for b in blocks {
+            y -= b.frame.height
+            b.frame = NSRect(x: pad, y: y, width: b.frame.width, height: b.frame.height)
+            view.addSubview(b)
+            y -= 12
+        }
+        preferredContentSize = NSSize(width: width, height: total)
+    }
+
+    private func messageBlock(_ text: String, width: CGFloat) -> NSView {
+        let font = NSFont.systemFont(ofSize: 12)
+        let f = NSTextField(wrappingLabelWithString: text)
+        f.font = font
+        f.textColor = NSColor.secondaryLabelColor
+        f.preferredMaxLayoutWidth = width
+
+        let rect = (text as NSString).boundingRect(
+            with: NSSize(width: width, height: 600),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [NSAttributedString.Key.font: font])
+        f.frame = NSRect(x: 0, y: 0, width: width, height: max(18, ceil(rect.height) + 4))
+        return f
+    }
+
+    private func limitBlock(_ limit: Limit, width: CGFloat) -> NSView {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 42))
+
+        let pct = makeLabel("\(Int((limit.fraction * 100).rounded()))%",
+                            size: 13, weight: .regular,
+                            tone: NSColor.secondaryLabelColor, align: .right)
+        pct.frame = NSRect(x: width - 42, y: 22, width: 42, height: 18)
+
+        let reset = makeLabel(resetText(limit.resets), size: 12, weight: .regular,
+                              tone: NSColor.tertiaryLabelColor, align: .right)
+        reset.frame = NSRect(x: width - 218, y: 23, width: 168, height: 16)
+
+        let title = makeLabel(limit.title, size: 14, weight: .semibold,
+                              tone: NSColor.labelColor)
+        title.frame = NSRect(x: 0, y: 22, width: width - 224, height: 18)
+
+        let bar = BarView(frame: NSRect(x: 0, y: 4, width: width, height: 10))
+        bar.fraction = limit.fraction
+        bar.tint = color(for: limit)
+
+        container.addSubview(title)
+        container.addSubview(reset)
+        container.addSubview(pct)
+        container.addSubview(bar)
+        return container
+    }
+
+    @objc private func refreshTapped() { onRefresh?() }
+    @objc private func quitTapped() { NSApp.terminate(nil) }
+}
+
+// MARK: - App
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let popover = NSPopover()
+    let controller = UsageViewController()
+    let fetcher = UsageFetcher()
+    var timer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        popover.contentViewController = controller
+        popover.behavior = .transient
+        controller.onRefresh = { [weak self] in self?.refresh() }
+
+        if let button = statusItem.button {
+            button.image = gaugeImage(fraction: nil, tint: .systemBlue)
+            button.imagePosition = .imageLeading
+            button.title = " —"
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            button.target = self
+            button.action = #selector(togglePopover)
+        }
+
+        render(.loading)
+        refresh()
+
+        timer = Timer.scheduledTimer(withTimeInterval: kRefreshInterval, repeats: true) {
+            [weak self] _ in self?.refresh()
+        }
+    }
+
+    @objc func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            refresh()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func refresh() {
+        fetcher.fetch { [weak self] state in self?.render(state) }
+    }
+
+    func render(_ state: FetchState) {
+        controller.update(state)
+        guard let button = statusItem.button else { return }
+
+        switch state {
+        case .ok(let limits, _):
+            // Menu bar reflects whichever limit is closest to its cap.
+            if let worst = limits.max(by: { $0.fraction < $1.fraction }) {
+                button.image = gaugeImage(fraction: worst.fraction, tint: color(for: worst))
+                button.title = " \(Int((worst.fraction * 100).rounded()))%"
+            }
+            button.toolTip = limits
+                .map { "\($0.title): \(Int(($0.fraction * 100).rounded()))% · \(resetText($0.resets))" }
+                .joined(separator: "\n")
+
+        case .loading:
+            button.image = gaugeImage(fraction: nil, tint: .systemBlue)
+            button.title = " …"
+            button.toolTip = "Loading Claude usage…"
+
+        case .expired:
+            button.image = gaugeImage(fraction: nil, tint: .systemBlue)
+            button.title = " !"
+            button.toolTip = "Claude token expired — run `claude` in Terminal once"
+
+        default:
+            button.image = gaugeImage(fraction: nil, tint: .systemBlue)
+            button.title = " —"
+            button.toolTip = "Claude usage unavailable — click for details"
+        }
+    }
+}
+
+let application = NSApplication.shared
+let delegate = AppDelegate()
+application.delegate = delegate
+application.setActivationPolicy(.accessory)
+application.run()
