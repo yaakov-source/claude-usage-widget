@@ -258,17 +258,45 @@ static NSString *ResetText(NSDate *date) {
     return [@"Resets " stringByAppendingString:[f stringFromDate:date]];
 }
 
-static NSColor *ColorForLimit(LimitInfo *limit) {
-    if ([limit.severity isEqualToString:@"critical"]) return [NSColor systemRedColor];
-    if ([limit.severity isEqualToString:@"warning"])  return [NSColor systemOrangeColor];
-    if (limit.fraction >= 0.90) return [NSColor systemRedColor];
-    if (limit.fraction >= 0.75) return [NSColor systemOrangeColor];
-    return [NSColor systemBlueColor];
+#pragma mark - Palette
+
+static NSColor *RGB(double r, double g, double b) {
+    return [NSColor colorWithSRGBRed:r green:g blue:b alpha:1.0];
+}
+
+/// Violet, matching the accent the desktop app uses rather than system blue.
+/// Swept across the filled portion of each bar so that short bars show the
+/// whole ramp too, rather than only its bluest end.
+static NSGradient *PurpleGradient(void) {
+    static NSGradient *g = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g = [[NSGradient alloc] initWithStartingColor:RGB(0.52, 0.35, 0.96)
+                                          endingColor:RGB(0.74, 0.34, 0.95)];
+    });
+    return g;
+}
+
+/// Purple normally; warmer once the limit is close enough to matter. The
+/// escalation is the whole point of the colour, so it survives the restyle.
+static NSGradient *GradientForLimit(LimitInfo *limit) {
+    BOOL critical = [limit.severity isEqualToString:@"critical"] || limit.fraction >= 0.90;
+    BOOL warning  = [limit.severity isEqualToString:@"warning"]  || limit.fraction >= 0.75;
+
+    if (critical) {
+        return [[NSGradient alloc] initWithStartingColor:RGB(0.98, 0.35, 0.38)
+                                             endingColor:RGB(0.90, 0.22, 0.42)];
+    }
+    if (warning) {
+        return [[NSGradient alloc] initWithStartingColor:RGB(0.98, 0.62, 0.20)
+                                             endingColor:RGB(0.99, 0.45, 0.22)];
+    }
+    return PurpleGradient();
 }
 
 #pragma mark - Menu bar gauge
 
-static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
+static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
     CGFloat w = 25, h = 13;
     NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
     [image lockFocus];
@@ -290,11 +318,10 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
         CGFloat f = MAX(0.0, MIN(1.0, [fraction doubleValue]));
         CGFloat fw = f * inner.size.width;
         if (fw > 0.75) {
-            NSBezierPath *fill = [NSBezierPath bezierPathWithRoundedRect:
+            NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:
                                   NSMakeRect(NSMinX(inner), NSMinY(inner), fw, inner.size.height)
                                                                  xRadius:1.5 yRadius:1.5];
-            [tint setFill];
-            [fill fill];
+            [(fill ?: PurpleGradient()) drawInBezierPath:clip angle:0];
         }
     } else {
         [outline setFill];
@@ -309,8 +336,8 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
 #pragma mark - Bar view
 
 @interface BarView : NSView
-@property (nonatomic)         double   fraction;
-@property (nonatomic, strong) NSColor *tint;
+@property (nonatomic)         double      fraction;
+@property (nonatomic, strong) NSGradient *fillGradient;
 @end
 
 @implementation BarView
@@ -329,8 +356,7 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
     if (w > 1) {
         NSBezierPath *fill = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(0, y, w, h)
                                                              xRadius:h / 2 yRadius:h / 2];
-        [(self.tint ?: [NSColor systemBlueColor]) setFill];
-        [fill fill];
+        [(self.fillGradient ?: PurpleGradient()) drawInBezierPath:fill angle:0];
     }
 }
 
@@ -344,25 +370,54 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
 @property (nonatomic, copy)   NSString         *plan;
 @property (nonatomic, copy)   NSString         *message;
 @property (nonatomic, copy)   void (^onRefresh)(void);
+@property (nonatomic)         BOOL              busy;
 - (void)refreshUI;
 @end
 
 @implementation UsageViewController {
-    CGFloat _width;
+    CGFloat              _width;
+    NSStackView         *_stack;
+    NSButton            *_refreshButton;
+    NSProgressIndicator *_spinner;
+    NSDate              *_busySince;
 }
 
 - (instancetype)init {
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
-        _width = 330;
+        _width = 380;
         _state = UsageStateLoading;
         _limits = @[];
     }
     return self;
 }
 
+// Auto Layout throughout, deliberately. The previous version placed every block
+// with absolute frames and set the root view's frame by hand. NSPopover moves
+// that view for its own reasons once it is really on screen, which left the
+// content hard against the left edge with both margins stacked up on the right.
+// Constraints are measured against whatever bounds the popover actually hands
+// us, so the padding stays symmetric no matter what AppKit does.
 - (void)loadView {
-    self.view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, _width, 140)];
+    NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, _width, 140)];
+
+    _stack = [[NSStackView alloc] init];
+    _stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    _stack.alignment   = NSLayoutAttributeLeading;
+    _stack.spacing     = 12;
+    _stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:_stack];
+
+    // No width constraint on the root view: NSPopover sizes and positions it
+    // itself, and pinning it here is what knocked the content off-centre.
+    [NSLayoutConstraint activateConstraints:@[
+        [_stack.leadingAnchor  constraintEqualToAnchor:root.leadingAnchor  constant:16],
+        [_stack.trailingAnchor constraintEqualToAnchor:root.trailingAnchor constant:-16],
+        [_stack.topAnchor      constraintEqualToAnchor:root.topAnchor      constant:16],
+        [_stack.bottomAnchor   constraintEqualToAnchor:root.bottomAnchor   constant:-16],
+    ]];
+
+    self.view = root;
 }
 
 - (void)viewDidLoad {
@@ -382,61 +437,132 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
     f.alignment = align;
     f.cell.lineBreakMode = NSLineBreakByTruncatingTail;
     f.cell.usesSingleLineMode = YES;
+    f.translatesAutoresizingMaskIntoConstraints = NO;
     return f;
 }
 
-- (NSView *)messageBlock:(NSString *)text width:(CGFloat)width {
-    NSFont *font = [NSFont systemFontOfSize:12];
+/// Wraps to the column width on its own now — no hand-measured bounding rect.
+- (NSView *)messageBlock:(NSString *)text {
     NSTextField *f = [NSTextField wrappingLabelWithString:text ?: @""];
-    f.font = font;
+    f.font = [NSFont systemFontOfSize:12];
     f.textColor = [NSColor secondaryLabelColor];
-    f.preferredMaxLayoutWidth = width;
-
-    NSRect rect = [(text ?: @"") boundingRectWithSize:NSMakeSize(width, 600)
-                                              options:NSStringDrawingUsesLineFragmentOrigin |
-                                                      NSStringDrawingUsesFontLeading
-                                           attributes:@{NSFontAttributeName: font}];
-    f.frame = NSMakeRect(0, 0, width, MAX(18.0, ceil(rect.size.height) + 4));
+    f.translatesAutoresizingMaskIntoConstraints = NO;
     return f;
 }
 
-- (NSView *)limitBlock:(LimitInfo *)limit width:(CGFloat)width {
-    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, 42)];
-
-    NSString *pctText = [NSString stringWithFormat:@"%ld%%", (long)lround(limit.fraction * 100)];
-    NSTextField *pct = [self labelWithText:pctText size:13 bold:NO
-                                      tone:[NSColor secondaryLabelColor]
-                                     align:NSTextAlignmentRight];
-    pct.frame = NSMakeRect(width - 42, 22, 42, 18);
-
-    NSTextField *reset = [self labelWithText:ResetText(limit.resets) size:12 bold:NO
-                                        tone:[NSColor tertiaryLabelColor]
-                                       align:NSTextAlignmentRight];
-    reset.frame = NSMakeRect(width - 218, 23, 168, 16);
+- (NSView *)limitBlock:(LimitInfo *)limit {
+    NSView *row = [[NSView alloc] initWithFrame:NSZeroRect];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
 
     NSTextField *title = [self labelWithText:limit.title size:14 bold:YES
                                         tone:[NSColor labelColor]
                                        align:NSTextAlignmentLeft];
-    title.frame = NSMakeRect(0, 22, width - 224, 18);
+    NSTextField *reset = [self labelWithText:ResetText(limit.resets) size:12 bold:NO
+                                        tone:[NSColor tertiaryLabelColor]
+                                       align:NSTextAlignmentRight];
+    NSString *pctText = [NSString stringWithFormat:@"%ld%%", (long)lround(limit.fraction * 100)];
+    NSTextField *pct = [self labelWithText:pctText size:13 bold:NO
+                                      tone:[NSColor secondaryLabelColor]
+                                     align:NSTextAlignmentRight];
 
-    BarView *bar = [[BarView alloc] initWithFrame:NSMakeRect(0, 4, width, 10)];
-    bar.fraction = limit.fraction;
-    bar.tint = ColorForLimit(limit);
+    BarView *bar = [[BarView alloc] initWithFrame:NSZeroRect];
+    bar.fraction     = limit.fraction;
+    bar.fillGradient = GradientForLimit(limit);
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
 
-    [container addSubview:title];
-    [container addSubview:reset];
-    [container addSubview:pct];
-    [container addSubview:bar];
-    return container;
+    for (NSView *v in @[title, reset, pct, bar]) [row addSubview:v];
+
+    // The reset time and percentage hug their text; the title absorbs the slack
+    // and is the only column allowed to truncate.
+    NSLayoutConstraintOrientation hz = NSLayoutConstraintOrientationHorizontal;
+    [title setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:hz];
+    for (NSTextField *f in @[reset, pct]) {
+        [f setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:hz];
+        [f setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:hz];
+    }
+
+    [NSLayoutConstraint activateConstraints:@[
+        [title.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [title.topAnchor     constraintEqualToAnchor:row.topAnchor],
+
+        [pct.trailingAnchor      constraintEqualToAnchor:row.trailingAnchor],
+        [pct.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor],
+
+        [reset.trailingAnchor      constraintEqualToAnchor:pct.leadingAnchor constant:-8],
+        [reset.firstBaselineAnchor constraintEqualToAnchor:title.firstBaselineAnchor],
+        [reset.leadingAnchor constraintGreaterThanOrEqualToAnchor:title.trailingAnchor constant:8],
+
+        [bar.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor],
+        [bar.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [bar.topAnchor      constraintEqualToAnchor:title.bottomAnchor constant:8],
+        [bar.heightAnchor   constraintEqualToConstant:8],
+        [bar.bottomAnchor   constraintEqualToAnchor:row.bottomAnchor],
+    ]];
+    return row;
+}
+
+- (NSView *)footerBlock {
+    NSView *footer = [[NSView alloc] initWithFrame:NSZeroRect];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSButton *refresh = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(refreshTapped)];
+    NSButton *quit    = [NSButton buttonWithTitle:@"Quit" target:NSApp action:@selector(terminate:)];
+    for (NSButton *b in @[refresh, quit]) {
+        b.bezelStyle  = NSBezelStyleInline;
+        b.controlSize = NSControlSizeSmall;
+        b.font        = [NSFont systemFontOfSize:11];
+        b.translatesAutoresizingMaskIntoConstraints = NO;
+        [footer addSubview:b];
+    }
+    // Fixed width, so swapping the title to "Refreshing…" doesn't shove the
+    // footer around mid-click.
+    [[refresh.widthAnchor constraintGreaterThanOrEqualToConstant:86] setActive:YES];
+
+    NSProgressIndicator *spinner = [[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
+    spinner.style = NSProgressIndicatorStyleSpinning;
+    spinner.controlSize = NSControlSizeSmall;
+    spinner.indeterminate = YES;
+    spinner.displayedWhenStopped = NO;
+    spinner.hidden = YES;
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [footer addSubview:spinner];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [refresh.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor],
+        [refresh.topAnchor     constraintEqualToAnchor:footer.topAnchor],
+        [refresh.bottomAnchor  constraintEqualToAnchor:footer.bottomAnchor],
+        [spinner.leadingAnchor constraintEqualToAnchor:refresh.trailingAnchor constant:8],
+        [spinner.centerYAnchor constraintEqualToAnchor:refresh.centerYAnchor],
+        [spinner.widthAnchor   constraintEqualToConstant:14],
+        [spinner.heightAnchor  constraintEqualToConstant:14],
+        [quit.trailingAnchor      constraintEqualToAnchor:footer.trailingAnchor],
+        [quit.firstBaselineAnchor constraintEqualToAnchor:refresh.firstBaselineAnchor],
+    ]];
+
+    // The footer is rebuilt on every render; carry the current state across.
+    _refreshButton = refresh;
+    _spinner = spinner;
+    [self applyBusyState];
+    return footer;
+}
+
+/// Every row spans the full column. Pinned explicitly, because the stack view's
+/// own Width alignment leaves single-line labels at their intrinsic width.
+- (void)addRow:(NSView *)row {
+    [_stack addArrangedSubview:row];
+    [[row.widthAnchor constraintEqualToAnchor:_stack.widthAnchor] setActive:YES];
 }
 
 - (void)refreshUI {
-    NSView *root = self.view;   // loads the view if needed
-    for (NSView *sub in [root.subviews copy]) [sub removeFromSuperview];
+    // Touching self.view loads it, and viewDidLoad calls straight back here
+    // with the stack in place. Without this the first render built everything
+    // twice.
+    if (!_stack) { (void)self.view; return; }
 
-    CGFloat pad = 16;
-    CGFloat contentWidth = _width - pad * 2;
-    NSMutableArray<NSView *> *blocks = [NSMutableArray array];
+    for (NSView *v in [_stack.arrangedSubviews copy]) {
+        [_stack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
 
     NSString *headerText = @"Claude usage";
     if (self.state == UsageStateOK) {
@@ -444,74 +570,88 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
             ? [NSString stringWithFormat:@"Plan usage limits · %@", self.plan]
             : @"Plan usage limits";
     }
-    NSTextField *header = [self labelWithText:headerText size:12 bold:NO
-                                         tone:[NSColor secondaryLabelColor]
-                                        align:NSTextAlignmentLeft];
-    header.frame = NSMakeRect(0, 0, contentWidth, 16);
-    [blocks addObject:header];
+    [self addRow:[self labelWithText:headerText size:12 bold:NO
+                                tone:[NSColor secondaryLabelColor]
+                               align:NSTextAlignmentLeft]];
 
     switch (self.state) {
         case UsageStateLoading:
-            [blocks addObject:[self messageBlock:@"Loading…" width:contentWidth]];
+            [self addRow:[self messageBlock:@"Loading…"]];
             break;
         case UsageStateNoCredentials:
-            [blocks addObject:[self messageBlock:
-                @"No Claude token found.\nRun `claude` in Terminal and sign in, then refresh."
-                                            width:contentWidth]];
+            [self addRow:[self messageBlock:
+                @"No Claude token found.\nRun `claude` in Terminal and sign in, then refresh."]];
             break;
         case UsageStateExpired:
-            [blocks addObject:[self messageBlock:
-                @"Token expired.\nRun `claude` in Terminal once to refresh it, then refresh here."
-                                            width:contentWidth]];
+            [self addRow:[self messageBlock:
+                @"Token expired.\nRun `claude` in Terminal once to refresh it, then refresh here."]];
             break;
         case UsageStateError:
-            [blocks addObject:[self messageBlock:(self.message ?: @"Something went wrong.")
-                                            width:contentWidth]];
+            [self addRow:[self messageBlock:(self.message ?: @"Something went wrong.")]];
             break;
         case UsageStateOK:
             for (LimitInfo *limit in self.limits) {
-                [blocks addObject:[self limitBlock:limit width:contentWidth]];
+                [self addRow:[self limitBlock:limit]];
             }
             if (self.message.length) {
-                [blocks addObject:[self messageBlock:self.message width:contentWidth]];
+                [self addRow:[self messageBlock:self.message]];
             }
             break;
     }
 
-    NSView *footer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, contentWidth, 22)];
-    NSButton *refresh = [NSButton buttonWithTitle:@"Refresh" target:self action:@selector(refreshTapped)];
-    refresh.bezelStyle = NSBezelStyleInline;
-    refresh.controlSize = NSControlSizeSmall;
-    refresh.font = [NSFont systemFontOfSize:11];
-    [refresh sizeToFit];
-    refresh.frame = NSMakeRect(0, 0, MAX(62.0, refresh.frame.size.width), 20);
-    [footer addSubview:refresh];
+    [self addRow:[self footerBlock]];
 
-    NSButton *quit = [NSButton buttonWithTitle:@"Quit" target:NSApp action:@selector(terminate:)];
-    quit.bezelStyle = NSBezelStyleInline;
-    quit.controlSize = NSControlSizeSmall;
-    quit.font = [NSFont systemFontOfSize:11];
-    [quit sizeToFit];
-    CGFloat qw = MAX(50.0, quit.frame.size.width);
-    quit.frame = NSMakeRect(contentWidth - qw, 0, qw, 20);
-    [footer addSubview:quit];
-    [blocks addObject:footer];
+    // Measure the column at its intended width with a throwaway constraint.
+    // refreshUI runs while the popover is on screen, so resizing the live view
+    // to measure it would flicker.
+    NSLayoutConstraint *probe = [_stack.widthAnchor constraintEqualToConstant:_width - 32];
+    probe.priority = NSLayoutPriorityDefaultHigh;
+    probe.active = YES;
+    [_stack layoutSubtreeIfNeeded];
+    CGFloat height = [_stack fittingSize].height;
+    probe.active = NO;
+    self.preferredContentSize = NSMakeSize(_width, height + 32);
+}
 
-    CGFloat total = pad * 2;
-    for (NSUInteger i = 0; i < blocks.count; i++) {
-        total += blocks[i].frame.size.height;
-        if (i > 0) total += 12;
+/// Held for a beat on the way down. A cached or fast response returns in well
+/// under a frame, and an indicator that appears and vanishes that quickly reads
+/// as nothing having happened at all.
+- (void)setBusy:(BOOL)busy {
+    if (busy) {
+        _busy = YES;
+        _busySince = [NSDate date];
+        [self applyBusyState];
+        return;
     }
 
-    root.frame = NSMakeRect(0, 0, _width, total);
-    CGFloat y = total - pad;
-    for (NSView *b in blocks) {
-        y -= b.frame.size.height;
-        b.frame = NSMakeRect(pad, y, b.frame.size.width, b.frame.size.height);
-        [root addSubview:b];
-        y -= 12;
+    NSTimeInterval shown = _busySince ? -[_busySince timeIntervalSinceNow] : 1.0;
+    NSTimeInterval remaining = MAX(0.0, 0.45 - shown);
+    if (remaining <= 0) {
+        _busy = NO;
+        [self applyBusyState];
+        return;
     }
-    self.preferredContentSize = NSMakeSize(_width, total);
+
+    __weak UsageViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UsageViewController *strong = weakSelf;
+        if (!strong) return;
+        strong->_busy = NO;
+        [strong applyBusyState];
+    });
+}
+
+- (void)applyBusyState {
+    _refreshButton.enabled = !_busy;
+    _refreshButton.title   = _busy ? @"Refreshing…" : @"Refresh";
+    if (_busy) {
+        _spinner.hidden = NO;
+        [_spinner startAnimation:nil];
+    } else {
+        [_spinner stopAnimation:nil];
+        _spinner.hidden = YES;
+    }
 }
 
 - (void)refreshTapped {
@@ -532,6 +672,8 @@ static NSImage *GaugeImage(NSNumber *fraction, NSColor *tint) {
              limits:(NSArray<LimitInfo *> *)limits
             message:(NSString *)message;
 - (void)renderDegradedWithNote:(NSString *)note;
+- (void)markInFlight:(BOOL)flag;
+- (void)backOffAfter:(NSInteger)code http:(NSHTTPURLResponse *)http;
 - (NSString *)waitNote;
 - (void)cacheResponse:(NSData *)data;
 - (BOOL)loadCachedResponse;
@@ -543,12 +685,65 @@ static NSString *CachePath(void) {
 }
 
 /// Honour a server-supplied Retry-After when there is one.
+///
+/// Read through -valueForHTTPHeaderField:, which is documented case-insensitive.
+/// Subscripting allHeaderFields is NOT: this endpoint is served over HTTP/2,
+/// where header names travel lowercased, so `allHeaderFields[@"Retry-After"]`
+/// can miss entirely. Missing it means ignoring a long server-set cooldown and
+/// retrying into it on our own much shorter ladder, which is how a client stays
+/// blocked indefinitely.
 static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     if (!http) return 0;
-    id value = http.allHeaderFields[@"Retry-After"];
-    if (![value isKindOfClass:[NSString class]]) return 0;
-    double n = [(NSString *)value doubleValue];
-    return (n > 0 && n < 86400) ? n : 0;
+    NSString *value = [http valueForHTTPHeaderField:@"Retry-After"];
+    if (value.length == 0) return 0;
+
+    // RFC 9110 allows delta-seconds...
+    double n = [value doubleValue];
+    if (n > 0 && n < 86400) return n;
+
+    // ...or an HTTP-date, which doubleValue silently reads as 0.
+    static NSDateFormatter *rfc1123 = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        rfc1123 = [[NSDateFormatter alloc] init];
+        rfc1123.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        rfc1123.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"GMT"];
+        rfc1123.dateFormat = @"EEE, dd MMM yyyy HH:mm:ss zzz";
+    });
+    NSDate *when = [rfc1123 dateFromString:value];
+    if (!when) return 0;
+    NSTimeInterval delta = [when timeIntervalSinceNow];
+    return (delta > 0 && delta < 86400) ? delta : 0;
+}
+
+/// Appends one line per failure to a log beside the cached response, so a stuck
+/// widget can be diagnosed after the fact instead of guessed at.
+static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NSString *what) {
+    NSString *dir = [@"~/Library/Application Support/ClaudeUsageBar" stringByExpandingTildeInPath];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                             withIntermediateDirectories:YES attributes:nil error:NULL];
+
+    NSString *snippet = @"";
+    if (body.length) {
+        snippet = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding] ?: @"";
+        if (snippet.length > 200) snippet = [snippet substringToIndex:200];
+        snippet = [snippet stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    }
+
+    NSISO8601DateFormatter *stamp = [[NSISO8601DateFormatter alloc] init];
+    NSString *line = [NSString stringWithFormat:@"%@\tHTTP %ld\t%@\tretry-after=%@\t%@\n",
+                      [stamp stringFromDate:[NSDate date]], (long)code, what,
+                      [http valueForHTTPHeaderField:@"Retry-After"] ?: @"(none)", snippet];
+
+    NSString *path = [dir stringByAppendingPathComponent:@"failures.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return;
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
 }
 
 @implementation AppDelegate {
@@ -562,9 +757,12 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     // will 429 if polled casually. Cache aggressively, back off on refusal,
     // and keep showing the last good numbers rather than an error.
     NSArray<LimitInfo *> *_lastLimits;
-    NSDate               *_lastSuccess;
+    NSDate               *_lastSuccess;   // gates fetching
+    NSDate               *_dataAsOf;      // when the displayed numbers were true
     NSDate               *_nextAllowed;
     NSTimeInterval        _backoff;
+    BOOL                  _inFlight;    // exactly one request chain at a time
+    BOOL                  _serverAsked;  // the wait came from Retry-After, not us
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -582,7 +780,7 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     _controller.onRefresh = ^{ [weakSelf refreshForced:YES]; };
 
     _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    _statusItem.button.image = GaugeImage(nil, [NSColor systemBlueColor]);
+    _statusItem.button.image = GaugeImage(nil, nil);
     _statusItem.button.imagePosition = NSImageLeading;
     _statusItem.button.title = @" —";
     _statusItem.button.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
@@ -614,6 +812,13 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     }
 }
 
+/// Keeps the request flag and the popover's spinner in step. Main thread only,
+/// which is guaranteed now that every completion hops there first.
+- (void)markInFlight:(BOOL)flag {
+    _inFlight = flag;
+    _controller.busy = flag;
+}
+
 #pragma mark Networking
 
 - (void)request:(NSString *)urlString
@@ -639,7 +844,11 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
                                                             NSError *error) {
         NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
                                 ? (NSHTTPURLResponse *)response : nil;
-        done(http ? http.statusCode : 0, data, error, http);
+        NSInteger code = http ? http.statusCode : 0;
+        // Every piece of state this class keeps is touched from here and from
+        // the timer and the status-item click. Hop to the main thread once, so
+        // there is exactly one thread mutating any of it.
+        dispatch_async(dispatch_get_main_queue(), ^{ done(code, data, error, http); });
     }];
     [task resume];
 }
@@ -648,6 +857,13 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
 /// active backoff — retrying into a 429 is what keeps it tripped.
 - (void)refreshForced:(BOOL)forced {
     NSDate *now = [NSDate date];
+
+    // One request chain at a time. Launch fires a refresh, and clicking the
+    // status item before it lands used to fire a second: `_lastSuccess` is only
+    // written once a response arrives, so the freshness gate below waves the
+    // click straight through. Two Refresh clicks did the same. On an endpoint
+    // that 429s if polled casually, that is the app tripping its own limiter.
+    if (_inFlight) return;
 
     if (_nextAllowed && [now compare:_nextAllowed] == NSOrderedAscending) {
         [self renderDegradedWithNote:[self waitNote]];
@@ -663,12 +879,21 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
         return;
     }
 
+    [self markInFlight:YES];
+
     __weak AppDelegate *weakSelf = self;
     if (_planName.length == 0) {
         [self request:kProfileURL token:token done:^(NSInteger code, NSData *data,
                                                      NSError *error, NSHTTPURLResponse *http) {
             AppDelegate *strong = weakSelf;
             if (!strong) return;
+            if (code == 429 || code >= 500) {
+                // Don't spend a second request into an active refusal.
+                LogFailure(code, http, data, @"profile");
+                [strong backOffAfter:code http:http];
+                [strong renderDegradedWithNote:[strong waitNote]];
+                return;
+            }
             if (code == 200 && data) {
                 id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
                 if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -698,30 +923,27 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
                                                NSError *error, NSHTTPURLResponse *http) {
         AppDelegate *strong = weakSelf;
         if (!strong) return;
+        [strong markInFlight:NO];   // end of the chain, whatever happened
 
         if (error) {
+            LogFailure(0, http, nil, error.localizedDescription);
             [strong renderDegradedWithNote:[NSString stringWithFormat:@"Network error: %@",
                                             error.localizedDescription]];
             return;
         }
         if (code == 401 || code == 403) {
+            LogFailure(code, http, data, @"usage");
             [strong renderState:UsageStateExpired limits:@[] message:nil];
             return;
         }
         if (code == 429 || code >= 500) {
-            NSTimeInterval retryAfter = RetryAfterSeconds(http);
-            if (retryAfter > 0) {
-                strong->_backoff = retryAfter;
-            } else {
-                strong->_backoff = strong->_backoff > 0
-                    ? MIN(strong->_backoff * 2, 1800)   // cap at 30 minutes
-                    : 120;                              // first refusal: 2 minutes
-            }
-            strong->_nextAllowed = [NSDate dateWithTimeIntervalSinceNow:strong->_backoff];
+            LogFailure(code, http, data, @"usage");
+            [strong backOffAfter:code http:http];
             [strong renderDegradedWithNote:[strong waitNote]];
             return;
         }
         if (code != 200 || !data) {
+            LogFailure(code, http, data, @"usage");
             NSString *body = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
             if (body.length > 160) body = [body substringToIndex:160];
             [strong renderDegradedWithNote:[NSString stringWithFormat:@"HTTP %ld · %@",
@@ -747,9 +969,26 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
         strong->_backoff     = 0;
         strong->_nextAllowed = nil;
         strong->_lastSuccess = [NSDate date];
+        strong->_dataAsOf    = strong->_lastSuccess;
         strong->_lastLimits  = limits;
         [strong renderState:UsageStateOK limits:limits message:nil];
     }];
+}
+
+/// Honour the server's own cooldown when it sends one, otherwise climb the
+/// local ladder. Kept in one place so the profile and usage calls can't drift.
+- (void)backOffAfter:(NSInteger)code http:(NSHTTPURLResponse *)http {
+    [self markInFlight:NO];
+    NSTimeInterval retryAfter = RetryAfterSeconds(http);
+    if (retryAfter > 0) {
+        _backoff = retryAfter;
+        _serverAsked = YES;
+    } else {
+        _serverAsked = NO;
+        _backoff = _backoff > 0 ? MIN(_backoff * 2, 1800)   // cap at 30 minutes
+                                : 120;                      // first refusal: 2 minutes
+    }
+    _nextAllowed = [NSDate dateWithTimeIntervalSinceNow:_backoff];
 }
 
 /// Keep the last good numbers on screen when a fetch fails, with a footnote
@@ -767,16 +1006,21 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     if (remaining < 0) remaining = 0;
     long minutes = (long)ceil(remaining / 60.0);
     NSString *when = minutes <= 1 ? @"under a minute"
-                                  : [NSString stringWithFormat:@"%ld minutes", minutes];
+                                  : [NSString stringWithFormat:@"%ld more minutes", minutes];
 
-    if (_lastSuccess) {
+    // Say whose cooldown this is. "The server asked for 40 minutes" and "we
+    // backed off for 30 minutes on our own" are different problems, and the
+    // note is the only place the difference is visible.
+    NSString *whose = _serverAsked ? @"The server asked us to wait" : @"Backing off";
+
+    if (_dataAsOf) {
         NSDateFormatter *f = [[NSDateFormatter alloc] init];
         f.dateFormat = @"h:mm a";
         return [NSString stringWithFormat:
-                @"Rate limited. Showing values from %@ — retrying in %@.",
-                [f stringFromDate:_lastSuccess], when];
+                @"Rate limited — these are the values from %@. %@ %@.",
+                [f stringFromDate:_dataAsOf], whose, when];
     }
-    return [NSString stringWithFormat:@"Rate limited by the server. Retrying in %@.", when];
+    return [NSString stringWithFormat:@"Rate limited by the server. %@ %@.", whose, when];
 }
 
 - (void)cacheResponse:(NSData *)data {
@@ -815,6 +1059,7 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
     }
 
     _lastLimits = limits;
+    _dataAsOf   = when;   // not _lastSuccess: that would suppress the live fetch
     [self renderState:UsageStateOK limits:limits message:note];
     return YES;
 }
@@ -838,7 +1083,7 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
             LimitInfo *worst = limits[0];
             for (LimitInfo *l in limits) if (l.fraction > worst.fraction) worst = l;
 
-            button.image = GaugeImage(@(worst.fraction), ColorForLimit(worst));
+            button.image = GaugeImage(@(worst.fraction), GradientForLimit(worst));
             button.title = [NSString stringWithFormat:@" %ld%%", (long)lround(worst.fraction * 100)];
 
             NSMutableArray *lines = [NSMutableArray array];
@@ -848,15 +1093,15 @@ static NSTimeInterval RetryAfterSeconds(NSHTTPURLResponse *http) {
             }
             button.toolTip = [lines componentsJoinedByString:@"\n"];
         } else if (state == UsageStateLoading) {
-            button.image = GaugeImage(nil, [NSColor systemBlueColor]);
+            button.image = GaugeImage(nil, nil);
             button.title = @" …";
             button.toolTip = @"Loading Claude usage…";
         } else if (state == UsageStateExpired) {
-            button.image = GaugeImage(nil, [NSColor systemBlueColor]);
+            button.image = GaugeImage(nil, nil);
             button.title = @" !";
             button.toolTip = @"Claude token expired — run `claude` in Terminal once";
         } else {
-            button.image = GaugeImage(nil, [NSColor systemBlueColor]);
+            button.image = GaugeImage(nil, nil);
             button.title = @" —";
             button.toolTip = @"Claude usage unavailable — click for details";
         }

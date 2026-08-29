@@ -150,7 +150,18 @@ trip it. The widget is built to stay well under that:
 | Plan name | Fetched once, then persisted to `NSUserDefaults` — not re-fetched per launch |
 | On 429 or 5xx | Exponential backoff from 2 minutes, doubling to a 30-minute cap; honours `Retry-After` when present |
 | While backing off | **Forced refresh is ignored.** Retrying into a 429 is what keeps it tripped |
-| Display | Last good numbers stay on screen with a footnote: *"Rate limited. Showing values from 9:42 PM — retrying in 4 minutes."* |
+| Concurrent requests | One chain at a time. A click landing on an in-flight fetch is dropped, not duplicated |
+| Display | Last good numbers stay on screen with a footnote: *"Rate limited — these are the values from 9:42 PM. The server asked us to wait 4 more minutes."* |
+
+The footnote distinguishes a cooldown the **server** asked for (`Retry-After`) from
+one the widget imposed on itself. They are different problems and only the note
+makes the difference visible.
+
+The concurrent-request guard matters more than it looks. `_lastSuccess` is only
+written once a response arrives, so before the guard existed a click landing
+during the launch fetch sailed straight through the freshness check and issued a
+second call. Two Refresh clicks did the same. On an endpoint that 429s if polled
+casually, that was the app tripping its own limiter.
 
 If you trip it anyway — usually by running the diagnostic probes repeatedly —
 the only fix is to stop calling and wait. No client-side change makes a
@@ -199,6 +210,16 @@ The last successful raw response is always cached at:
 ```
 
 That file is the fastest way to see what the API actually returned.
+
+Every failed request appends a line to:
+
+```
+~/Library/Application Support/ClaudeUsageBar/failures.log
+```
+
+with the timestamp, HTTP status, the server's `Retry-After`, and the first 200
+characters of the body. If the widget is stuck showing stale numbers, read this
+before theorising — it is the difference between knowing and guessing.
 
 ---
 
