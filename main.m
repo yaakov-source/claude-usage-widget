@@ -34,10 +34,37 @@ typedef NS_ENUM(NSInteger, UsageState) {
 
 @interface LimitInfo : NSObject
 @property (nonatomic, copy)   NSString *title;
-@property (nonatomic)         double    fraction;   // 0...1
+@property (nonatomic, copy)   NSString *kind;       // server's key: session, weekly_all, ...
+@property (nonatomic)         double    fraction;   // 0...1, the portion USED
 @property (nonatomic, strong) NSDate   *resets;
 @property (nonatomic, copy)   NSString *severity;
 @end
+
+/// The menu bar alone is phrased as what's left rather than what's spent: the
+/// icon is a battery, and a battery reading 0% on an untouched plan looks
+/// broken. The popover and its tooltip keep showing usage, matching the desktop
+/// app's panel. `fraction` stays as usage throughout — it is what the API sends
+/// and what the severity thresholds are written against.
+static double RemainingFraction(LimitInfo *limit) {
+    return MAX(0.0, MIN(1.0, 1.0 - limit.fraction));
+}
+
+static long RemainingPercent(LimitInfo *limit) {
+    return (long)lround(RemainingFraction(limit) * 100);
+}
+
+/// Which limit the menu bar speaks for. The 5-hour window is the one that
+/// actually stops you working, so it wins outright. If the server ever stops
+/// sending a session limit, fall back to whichever is closest to its cap.
+static LimitInfo *MenuBarLimit(NSArray<LimitInfo *> *limits) {
+    if (limits.count == 0) return nil;
+    for (LimitInfo *l in limits) {
+        if ([l.kind isEqualToString:@"session"]) return l;
+    }
+    LimitInfo *worst = limits[0];
+    for (LimitInfo *l in limits) if (l.fraction > worst.fraction) worst = l;
+    return worst;
+}
 
 @implementation LimitInfo
 @end
@@ -202,6 +229,7 @@ static NSArray<LimitInfo *> *ParseLimits(id root) {
 
             LimitInfo *limit = [[LimitInfo alloc] init];
             limit.title = title;
+            limit.kind = kind;
             limit.fraction = MAX(0.0, MIN(1.0, [pct doubleValue] / 100.0));
             limit.resets = ParseDate(item[@"resets_at"]);
             limit.severity = [item[@"severity"] isKindOfClass:[NSString class]] ? item[@"severity"] : @"normal";
@@ -211,9 +239,9 @@ static NSArray<LimitInfo *> *ParseLimits(id root) {
     }
 
     // Fallback shape.
-    NSArray *fallback = @[@[@"five_hour", @"5-hour limit"],
-                          @[@"seven_day", @"Weekly · all models"],
-                          @[@"seven_day_opus", @"Weekly · Opus"]];
+    NSArray *fallback = @[@[@"five_hour",      @"5-hour limit",        @"session"],
+                          @[@"seven_day",      @"Weekly · all models", @"weekly_all"],
+                          @[@"seven_day_opus", @"Weekly · Opus",       @"weekly_scoped"]];
     for (NSArray *pair in fallback) {
         id obj = dict[pair[0]];
         if (![obj isKindOfClass:[NSDictionary class]]) continue;
@@ -221,6 +249,7 @@ static NSArray<LimitInfo *> *ParseLimits(id root) {
         if (!pct) continue;
         LimitInfo *limit = [[LimitInfo alloc] init];
         limit.title = pair[1];
+        limit.kind = pair[2];
         limit.fraction = MAX(0.0, MIN(1.0, [pct doubleValue] / 100.0));
         limit.resets = ParseDate(((NSDictionary *)obj)[@"resets_at"]);
         limit.severity = @"normal";
@@ -1080,11 +1109,9 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         if (!button) return;
 
         if (state == UsageStateOK && limits.count > 0) {
-            LimitInfo *worst = limits[0];
-            for (LimitInfo *l in limits) if (l.fraction > worst.fraction) worst = l;
-
-            button.image = GaugeImage(@(worst.fraction), GradientForLimit(worst));
-            button.title = [NSString stringWithFormat:@" %ld%%", (long)lround(worst.fraction * 100)];
+            LimitInfo *shown = MenuBarLimit(limits);
+            button.image = GaugeImage(@(RemainingFraction(shown)), GradientForLimit(shown));
+            button.title = [NSString stringWithFormat:@" %ld%%", RemainingPercent(shown)];
 
             NSMutableArray *lines = [NSMutableArray array];
             for (LimitInfo *l in limits) {

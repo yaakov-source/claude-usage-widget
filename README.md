@@ -23,12 +23,19 @@ without the explanations.
 
 ## What it does
 
-- **Menu bar:** a battery outline filled to whichever limit is closest to its
-  cap, with the percentage beside it. Blue under 75%, orange at 75%, red at 90%
-  — or whatever `severity` the API reports, if that's more severe. Hover for all
-  limits at once.
-- **Click:** popover with one row per limit — title, reset time, percentage,
-  progress bar — plus Refresh and Quit.
+- **Menu bar:** a battery outline tracking the **5-hour limit**, showing how
+  much is **left** — 100% on an untouched plan, draining as you work. That is
+  the one limit that actually stops you working, and a battery reading 0% when
+  nothing has been used looks broken. Purple under 75% used, orange at 75%, red
+  at 90% — or whatever `severity` the API reports, if that's more severe.
+- **Hover:** every limit at once, as **usage** percentages.
+- **Click:** popover with one row per limit — title, reset time, usage
+  percentage, progress bar — plus Refresh and Quit. Refresh shows a spinner and
+  reads "Refreshing…" while a fetch is in flight.
+
+Only the menu bar inverts to remaining. The popover and tooltip stay phrased as
+usage, matching the desktop app's own panel, so the two never disagree about
+what a number means — they just answer different questions.
 - Refreshes every 15 minutes. Opening the popover reuses data less than 60
   seconds old rather than making a request.
 - No dock icon, no window, no background daemon. One process, ~2 MB of RAM.
