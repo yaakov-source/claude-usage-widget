@@ -243,8 +243,27 @@ Nothing is hard-coded to one account — no UUIDs, no tokens, no paths outside
 
 - **Menu bar overflow.** New status items are inserted at the left of the status
   area, which on notched MacBook Pros is where the notch is. On a crowded menu
-  bar the icon simply won't render. [Ice](https://github.com/jordanbaird/Ice)
-  solves this.
+  bar the icon simply won't render — macOS places it and hides it, with no error.
+
+  The app logs its own placement at launch so this is checkable rather than
+  guessable:
+
+  ```
+  log show --predicate 'senderImagePath CONTAINS "ClaudeUsageBar"' --last 5m | grep "status item"
+  ```
+
+  ```
+  status item x=890-937 (width 47), screen 1728, notch spans 771-956 — has a slot
+  ```
+
+  A slot inside the notch range is the failure. Fixes, cheapest first: Cmd-drag
+  the icon out from under the notch (the position now persists, via
+  `autosaveName`), quit a menu bar app or two, or install
+  [Ice](https://github.com/jordanbaird/Ice).
+
+  The widget defaults to its narrowest style, ~26pt of text with no icon, to
+  make itself easy to fit. `defaults write com.haicreative.claudeusagebar
+  MenuBarStyle gauge` restores the battery, `icon` gives the battery alone.
 - **Undocumented endpoint.** See above.
 - **No token refresh.** See above.
 - **Unsigned.** Ad-hoc signed at build time. Fine for a locally built app; it

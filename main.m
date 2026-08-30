@@ -53,6 +53,34 @@ static long RemainingPercent(LimitInfo *limit) {
     return (long)lround(RemainingFraction(limit) * 100);
 }
 
+/// How much menu bar to occupy. On a notched Mac with a crowded bar, macOS
+/// silently drops whatever doesn't fit, so width is the difference between the
+/// widget existing and the widget being visible.
+///
+///   compact  just the number, ~26pt   (default)
+///   gauge    battery + number, ~55pt  (the original)
+///   icon     battery only, ~29pt
+///
+/// Change with: defaults write com.haicreative.claudeusagebar MenuBarStyle gauge
+static NSString *MenuBarStyle(void) {
+    NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"MenuBarStyle"];
+    if ([style isEqualToString:@"gauge"] || [style isEqualToString:@"icon"]) return style;
+    return @"compact";
+}
+
+/// Solid colour for the compact style, which has no bar to carry the gradient.
+/// Normal reads as ordinary menu bar text on purpose — colour should mean
+/// "look at me", so it should be absent until there is something to look at.
+static NSColor *TextColorForLimit(LimitInfo *limit) {
+    if ([limit.severity isEqualToString:@"critical"] || limit.fraction >= 0.90) {
+        return [NSColor systemRedColor];
+    }
+    if ([limit.severity isEqualToString:@"warning"] || limit.fraction >= 0.75) {
+        return [NSColor systemOrangeColor];
+    }
+    return [NSColor labelColor];
+}
+
 /// Which limit the menu bar speaks for. The 5-hour window is the one that
 /// actually stops you working, so it wins outright. If the server ever stops
 /// sending a session limit, fall back to whichever is closest to its cap.
@@ -809,10 +837,13 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     _controller.onRefresh = ^{ [weakSelf refreshForced:YES]; };
 
     _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    _statusItem.button.image = GaugeImage(nil, nil);
+    // Without this the item is treated as brand new on every launch and lands
+    // at the back of the queue — which on a full menu bar means off the edge.
+    // With it, macOS remembers where you Cmd-dragged it to.
+    _statusItem.autosaveName = @"ClaudeUsageBar";
     _statusItem.button.imagePosition = NSImageLeading;
-    _statusItem.button.title = @" —";
     _statusItem.button.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    [self applyButton:GaugeImage(nil, nil) title:@"—" tone:[NSColor labelColor]];
     _statusItem.button.target = self;
     _statusItem.button.action = @selector(togglePopover);
 
@@ -820,6 +851,40 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     // costs no request, and the live fetch below replaces them if it succeeds.
     [self loadCachedResponse];
     [self refreshForced:YES];
+
+    // Report where macOS actually placed us. The status item can be created
+    // successfully and still never appear: on a full menu bar the system drops
+    // whatever doesn't fit, silently and with no error. A frame off the left of
+    // the screen, or a zero width, is the difference between "not running" and
+    // "running but squeezed out" — and those need opposite fixes.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        AppDelegate *strong = weakSelf;
+        if (!strong) return;
+        NSRect frame  = strong->_statusItem.button.window.frame;
+        NSScreen *main = [NSScreen mainScreen];
+        NSRect screen  = main.frame;
+
+        // On a notched Mac the usable menu bar is split in two. AppKit reports
+        // the halves directly, so the notch can be described rather than
+        // guessed at from the screen width.
+        NSString *notch = @"no notch";
+        if (@available(macOS 12.0, *)) {
+            NSRect left  = main.auxiliaryTopLeftArea;
+            NSRect right = main.auxiliaryTopRightArea;
+            if (!NSIsEmptyRect(left) && !NSIsEmptyRect(right)) {
+                notch = [NSString stringWithFormat:@"notch spans %.0f-%.0f",
+                         NSMaxX(left), NSMinX(right)];
+            }
+        }
+
+        BOOL placed = NSWidth(frame) > 0 &&
+                      NSMinX(frame) >= 0 && NSMaxX(frame) <= NSWidth(screen);
+        NSLog(@"ClaudeUsageBar: status item x=%.0f-%.0f (width %.0f), screen %.0f, %@, "
+              @"style=%@ — %@", NSMinX(frame), NSMaxX(frame), NSWidth(frame),
+              NSWidth(screen), notch, MenuBarStyle(),
+              placed ? @"has a slot" : @"NO SLOT (menu bar is full)");
+    });
 
     _timer = [NSTimer scheduledTimerWithTimeInterval:kRefreshInterval
                                              repeats:YES
@@ -1095,6 +1160,31 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
 #pragma mark Rendering
 
+/// Applies the current MenuBarStyle. The status item's width is the sum of what
+/// we put in it, and on a full menu bar that width decides whether macOS shows
+/// the item at all.
+- (void)applyButton:(NSImage *)image title:(NSString *)title tone:(NSColor *)tone {
+    NSStatusBarButton *button = _statusItem.button;
+    if (!button) return;
+
+    NSString *style = MenuBarStyle();
+    if ([style isEqualToString:@"icon"]) {
+        button.image = image;
+        button.attributedTitle = [[NSAttributedString alloc] initWithString:@""];
+        return;
+    }
+
+    BOOL compact = ![style isEqualToString:@"gauge"];
+    button.image = compact ? nil : image;
+
+    NSString *text = compact ? title : [@" " stringByAppendingString:title];
+    button.attributedTitle = [[NSAttributedString alloc] initWithString:text attributes:@{
+        NSForegroundColorAttributeName: tone ?: [NSColor labelColor],
+        NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:12
+                                                              weight:NSFontWeightRegular],
+    }];
+}
+
 - (void)renderState:(UsageState)state
              limits:(NSArray<LimitInfo *> *)limits
             message:(NSString *)message {
@@ -1110,8 +1200,9 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
         if (state == UsageStateOK && limits.count > 0) {
             LimitInfo *shown = MenuBarLimit(limits);
-            button.image = GaugeImage(@(RemainingFraction(shown)), GradientForLimit(shown));
-            button.title = [NSString stringWithFormat:@" %ld%%", RemainingPercent(shown)];
+            [self applyButton:GaugeImage(@(RemainingFraction(shown)), GradientForLimit(shown))
+                        title:[NSString stringWithFormat:@"%ld%%", RemainingPercent(shown)]
+                         tone:TextColorForLimit(shown)];
 
             NSMutableArray *lines = [NSMutableArray array];
             for (LimitInfo *l in limits) {
@@ -1120,16 +1211,13 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
             }
             button.toolTip = [lines componentsJoinedByString:@"\n"];
         } else if (state == UsageStateLoading) {
-            button.image = GaugeImage(nil, nil);
-            button.title = @" …";
+            [self applyButton:GaugeImage(nil, nil) title:@"…" tone:[NSColor labelColor]];
             button.toolTip = @"Loading Claude usage…";
         } else if (state == UsageStateExpired) {
-            button.image = GaugeImage(nil, nil);
-            button.title = @" !";
+            [self applyButton:GaugeImage(nil, nil) title:@"!" tone:[NSColor systemRedColor]];
             button.toolTip = @"Claude token expired — run `claude` in Terminal once";
         } else {
-            button.image = GaugeImage(nil, nil);
-            button.title = @" —";
+            [self applyButton:GaugeImage(nil, nil) title:@"—" tone:[NSColor labelColor]];
             button.toolTip = @"Claude usage unavailable — click for details";
         }
     });
