@@ -322,6 +322,46 @@ static NSArray<LimitInfo *> *ParseLimits(id root) {
     return out;
 }
 
+/// Claude Code keeps its own copy of this exact payload in ~/.claude.json under
+/// `cachedUsageUtilization`, wrapped with a `fetchedAtMs` stamp. Same schema, so
+/// ParseLimits handles it unchanged.
+///
+/// It is not a live feed — Claude Code refreshes it on its own schedule and it
+/// can be days stale — but it costs no request, and the stamp means its age is
+/// known rather than assumed. Worth having as a second source precisely because
+/// the one thing we cannot do while rate limited is ask the server.
+static NSArray<LimitInfo *> *LimitsFromClaudeCode(NSDate **fetchedAt) {
+    NSString *path = [@"~/.claude.json" stringByExpandingTildeInPath];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) return nil;
+
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    id cached = ((NSDictionary *)obj)[@"cachedUsageUtilization"];
+    if (![cached isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSDictionary *wrapper = cached;
+    NSArray<LimitInfo *> *limits = ParseLimits(wrapper[@"utilization"]);
+    if (limits.count == 0) return nil;
+
+    if (fetchedAt) {
+        NSNumber *ms = Numeric(wrapper[@"fetchedAtMs"]);
+        *fetchedAt = ms ? [NSDate dateWithTimeIntervalSince1970:[ms doubleValue] / 1000.0] : nil;
+    }
+    return limits;
+}
+
+/// "3 days ago" beats a bare clock time once numbers are more than a few hours
+/// old — the age is the thing that decides whether to trust them.
+static NSString *AgeText(NSDate *when) {
+    if (!when) return @"unknown age";
+    NSTimeInterval s = -[when timeIntervalSinceNow];
+    if (s < 90)    return @"just now";
+    if (s < 3600)  return [NSString stringWithFormat:@"%ld min ago", (long)(s / 60)];
+    if (s < 86400) return [NSString stringWithFormat:@"%ld hr ago",  (long)(s / 3600)];
+    return [NSString stringWithFormat:@"%ld days ago", (long)(s / 86400)];
+}
+
 static NSString *PrettyPlan(NSString *tier) {
     if (![tier isKindOfClass:[NSString class]] || tier.length == 0) return nil;
     if ([tier isEqualToString:@"default_claude_max_20x"]) return @"Max (20x)";
@@ -765,6 +805,7 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
              limits:(NSArray<LimitInfo *> *)limits
             message:(NSString *)message;
 - (void)renderDegradedWithNote:(NSString *)note;
+- (BOOL)adoptClaudeCodeCacheIfNewer;
 - (void)markInFlight:(BOOL)flag;
 - (void)backOffAfter:(NSInteger)code http:(NSHTTPURLResponse *)http;
 - (NSString *)waitNote;
@@ -857,6 +898,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     BOOL                  _inFlight;    // exactly one request chain at a time
     BOOL                  _serverAsked;  // the wait came from Retry-After, not us
     BOOL                  _authExpired;  // 401 seen; polling on is pointless and harmful
+    BOOL                  _fromClaudeCode;  // showing Claude Code's cache, not ours
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -1121,7 +1163,8 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
         strong->_backoff     = 0;
         strong->_nextAllowed = nil;
-        strong->_authExpired = NO;
+        strong->_authExpired    = NO;
+        strong->_fromClaudeCode = NO;
         [strong rememberCooldown];
         strong->_lastSuccess = [NSDate date];
         strong->_dataAsOf    = strong->_lastSuccess;
@@ -1172,9 +1215,26 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     [self rememberCooldown];
 }
 
+/// Take Claude Code's cached copy only when it beats what we already have.
+/// Strictly newer, never merely different: our own last fetch is usually the
+/// better source, and silently swapping in older numbers would be a regression
+/// dressed up as a fallback.
+- (BOOL)adoptClaudeCodeCacheIfNewer {
+    NSDate *fetched = nil;
+    NSArray<LimitInfo *> *limits = LimitsFromClaudeCode(&fetched);
+    if (limits.count == 0 || !fetched) return NO;
+    if (_dataAsOf && [fetched compare:_dataAsOf] != NSOrderedDescending) return NO;
+
+    _lastLimits  = limits;
+    _dataAsOf    = fetched;
+    _fromClaudeCode = YES;
+    return YES;
+}
+
 /// Keep the last good numbers on screen when a fetch fails, with a footnote
 /// explaining why they might be stale. Better than a wall of JSON.
 - (void)renderDegradedWithNote:(NSString *)note {
+    [self adoptClaudeCodeCacheIfNewer];
     if (_lastLimits.count > 0) {
         [self renderState:UsageStateOK limits:_lastLimits message:note];
     } else {
@@ -1200,11 +1260,9 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     }
 
     if (_dataAsOf) {
-        NSDateFormatter *f = [[NSDateFormatter alloc] init];
-        f.dateFormat = @"h:mm a";
-        return [NSString stringWithFormat:
-                @"Rate limited — these are the values from %@. %@ %@.",
-                [f stringFromDate:_dataAsOf], whose, when];
+        return [NSString stringWithFormat:@"Rate limited — showing %@ from %@. %@ %@.",
+                _fromClaudeCode ? @"Claude Code's numbers" : @"the last values fetched",
+                AgeText(_dataAsOf), whose, when];
     }
     return [NSString stringWithFormat:@"Rate limited by the server. %@ %@.", whose, when];
 }
