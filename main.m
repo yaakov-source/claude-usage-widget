@@ -134,7 +134,34 @@ static NSString *DecodeHex(NSString *s) {
     return [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
 }
 
-static NSString *TokenFromJSONText(NSString *text) {
+/// The token plus the expiry that ships alongside it in the same blob.
+///
+/// Reading `expiresAt` is what keeps this app out of trouble. An expired token
+/// earns a 401, and enough 401s earn a 429 with a flat one-hour Retry-After —
+/// the server rate limits failed auth. Knowing the token is dead *before*
+/// spending a request means that cascade can never start.
+@interface OAuthToken : NSObject
+@property (nonatomic, copy)   NSString *value;
+@property (nonatomic, strong) NSDate   *expires;   // nil when the blob omits it
+- (BOOL)isExpired;
+@end
+
+@implementation OAuthToken
+/// A minute of slack: a token expiring while the request is in flight comes
+/// back as a 401 just the same.
+- (BOOL)isExpired {
+    return self.expires != nil && [self.expires timeIntervalSinceNow] <= 60.0;
+}
+@end
+
+static NSDate *ExpiryFrom(id value) {
+    if (![value isKindOfClass:[NSNumber class]]) return nil;
+    double n = [value doubleValue];
+    if (n <= 0) return nil;
+    return [NSDate dateWithTimeIntervalSince1970:(n > 1e12 ? n / 1000.0 : n)];
+}
+
+static OAuthToken *TokenFromJSONText(NSString *text) {
     if (text.length == 0) return nil;
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (!data) return nil;
@@ -142,17 +169,26 @@ static NSString *TokenFromJSONText(NSString *text) {
     if (![obj isKindOfClass:[NSDictionary class]]) return nil;
 
     NSDictionary *dict = obj;
+    NSDictionary *source = nil;
     id inner = dict[@"claudeAiOauth"];
-    if ([inner isKindOfClass:[NSDictionary class]]) {
-        id t = ((NSDictionary *)inner)[@"accessToken"];
-        if ([t isKindOfClass:[NSString class]] && [t length] > 0) return t;
+    if ([inner isKindOfClass:[NSDictionary class]] &&
+        [((NSDictionary *)inner)[@"accessToken"] isKindOfClass:[NSString class]]) {
+        source = inner;
+    } else if ([dict[@"accessToken"] isKindOfClass:[NSString class]]) {
+        source = dict;
     }
-    id t2 = dict[@"accessToken"];
-    if ([t2 isKindOfClass:[NSString class]] && [t2 length] > 0) return t2;
-    return nil;
+    if (!source) return nil;
+
+    NSString *value = source[@"accessToken"];
+    if (value.length == 0) return nil;
+
+    OAuthToken *token = [[OAuthToken alloc] init];
+    token.value   = value;
+    token.expires = ExpiryFrom(source[@"expiresAt"]);
+    return token;
 }
 
-static NSString *ReadOAuthToken(void) {
+static OAuthToken *ReadOAuthToken(void) {
     NSArray *services = @[@"Claude Code-credentials", @"Claude Code"];
     for (NSString *service in services) {
         NSString *raw = RunSecurity(service);
@@ -165,7 +201,7 @@ static NSString *ReadOAuthToken(void) {
             NSString *decoded = DecodeHex(raw);
             if (decoded) raw = decoded;
         }
-        NSString *token = TokenFromJSONText(raw);
+        OAuthToken *token = TokenFromJSONText(raw);
         if (token) return token;
     }
 
@@ -966,10 +1002,9 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         return;
     }
 
-    // An expired token does not heal on its own, and the server counts the
-    // failures: four 401s on the timer earned an hour-long 429. Stop polling
-    // once auth is dead and wait to be told to try again, which is what the
-    // Refresh button is for — you press it after running `claude`.
+    // Backstop for a 401 the expiry check could not predict — a revoked token,
+    // or a blob with no expiresAt. The expiry check below is the primary
+    // defence; this catches what it cannot see.
     if (_authExpired && !forced) {
         [self renderState:UsageStateExpired limits:@[] message:nil];
         return;
@@ -978,17 +1013,29 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         return;  // recent enough — leave the UI as it is, make no request
     }
 
-    NSString *token = ReadOAuthToken();
-    if (token.length == 0) {
+    OAuthToken *token = ReadOAuthToken();
+    if (token.value.length == 0) {
         [self renderState:UsageStateNoCredentials limits:@[] message:nil];
         return;
     }
+
+    // The whole point of reading expiresAt: refuse to spend a request we can
+    // already prove will fail. Every 401 this avoids is one that can't be
+    // counted toward a 429, and the 429 is the expensive part — a flat hour,
+    // regardless of how the failures were earned. Costs one local keychain
+    // read; saves the lockout entirely.
+    if (token.isExpired) {
+        _authExpired = YES;
+        [self renderState:UsageStateExpired limits:@[] message:nil];
+        return;
+    }
+    _authExpired = NO;   // a fresh token means the last failure is behind us
 
     [self markInFlight:YES];
 
     __weak AppDelegate *weakSelf = self;
     if (_planName.length == 0) {
-        [self request:kProfileURL token:token done:^(NSInteger code, NSData *data,
+        [self request:kProfileURL token:token.value done:^(NSInteger code, NSData *data,
                                                      NSError *error, NSHTTPURLResponse *http) {
             AppDelegate *strong = weakSelf;
             if (!strong) return;
@@ -1015,10 +1062,10 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
                     }
                 }
             }
-            [strong fetchUsageWithToken:token];
+            [strong fetchUsageWithToken:token.value];
         }];
     } else {
-        [self fetchUsageWithToken:token];
+        [self fetchUsageWithToken:token.value];
     }
 }
 
