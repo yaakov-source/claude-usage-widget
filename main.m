@@ -820,6 +820,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     NSTimeInterval        _backoff;
     BOOL                  _inFlight;    // exactly one request chain at a time
     BOOL                  _serverAsked;  // the wait came from Retry-After, not us
+    BOOL                  _authExpired;  // 401 seen; polling on is pointless and harmful
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -832,6 +833,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     _planName = [[NSUserDefaults standardUserDefaults] stringForKey:@"PlanName"];
     _lastLimits = @[];
     _backoff = 0;
+    [self restoreCooldown];
 
     __weak AppDelegate *weakSelf = self;
     _controller.onRefresh = ^{ [weakSelf refreshForced:YES]; };
@@ -963,6 +965,15 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         [self renderDegradedWithNote:[self waitNote]];
         return;
     }
+
+    // An expired token does not heal on its own, and the server counts the
+    // failures: four 401s on the timer earned an hour-long 429. Stop polling
+    // once auth is dead and wait to be told to try again, which is what the
+    // Refresh button is for — you press it after running `claude`.
+    if (_authExpired && !forced) {
+        [self renderState:UsageStateExpired limits:@[] message:nil];
+        return;
+    }
     if (!forced && _lastSuccess && [now timeIntervalSinceDate:_lastSuccess] < kFreshnessWindow) {
         return;  // recent enough — leave the UI as it is, make no request
     }
@@ -1027,6 +1038,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         }
         if (code == 401 || code == 403) {
             LogFailure(code, http, data, @"usage");
+            strong->_authExpired = YES;
             [strong renderState:UsageStateExpired limits:@[] message:nil];
             return;
         }
@@ -1062,6 +1074,8 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
         strong->_backoff     = 0;
         strong->_nextAllowed = nil;
+        strong->_authExpired = NO;
+        [strong rememberCooldown];
         strong->_lastSuccess = [NSDate date];
         strong->_dataAsOf    = strong->_lastSuccess;
         strong->_lastLimits  = limits;
@@ -1071,6 +1085,31 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
 /// Honour the server's own cooldown when it sends one, otherwise climb the
 /// local ladder. Kept in one place so the profile and usage calls can't drift.
+/// Persisted, because it used to live only in memory. Quitting and reopening
+/// the app wiped an outstanding cooldown and fired a request straight back into
+/// it — which is how a one-hour Retry-After turned into an afternoon of them.
+- (void)rememberCooldown {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (_nextAllowed) {
+        [d setDouble:[_nextAllowed timeIntervalSince1970] forKey:@"NextAllowedAt"];
+        [d setDouble:_backoff forKey:@"Backoff"];
+    } else {
+        [d removeObjectForKey:@"NextAllowedAt"];
+        [d removeObjectForKey:@"Backoff"];
+    }
+}
+
+- (void)restoreCooldown {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    double at = [d doubleForKey:@"NextAllowedAt"];
+    if (at <= 0) return;
+    NSDate *when = [NSDate dateWithTimeIntervalSince1970:at];
+    if ([when timeIntervalSinceNow] <= 0) { [self rememberCooldown]; return; }
+    _nextAllowed = when;
+    _backoff     = [d doubleForKey:@"Backoff"];
+    _serverAsked = YES;   // only a server-set wait is worth surviving a restart
+}
+
 - (void)backOffAfter:(NSInteger)code http:(NSHTTPURLResponse *)http {
     [self markInFlight:NO];
     NSTimeInterval retryAfter = RetryAfterSeconds(http);
@@ -1083,6 +1122,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
                                 : 120;                      // first refusal: 2 minutes
     }
     _nextAllowed = [NSDate dateWithTimeIntervalSinceNow:_backoff];
+    [self rememberCooldown];
 }
 
 /// Keep the last good numbers on screen when a fetch fails, with a footnote
@@ -1106,6 +1146,11 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     // backed off for 30 minutes on our own" are different problems, and the
     // note is the only place the difference is visible.
     NSString *whose = _serverAsked ? @"The server asked us to wait" : @"Backing off";
+    if (_authExpired) {
+        return [NSString stringWithFormat:
+                @"Your token expired — run `claude` in Terminal once, then press "
+                 "Refresh. (Also rate limited: %@ %@.)", whose, when];
+    }
 
     if (_dataAsOf) {
         NSDateFormatter *f = [[NSDateFormatter alloc] init];
