@@ -176,14 +176,33 @@ rate-limited server answer sooner.
 
 ### Token expiry
 
-Access tokens last roughly 8 hours. **The widget does not refresh them** — it
-detects 401/403, shows `!` in the menu bar, and tells you to run `claude` once,
-which refreshes the token in place.
+Access tokens last roughly 8 hours. **The widget does not refresh them.** It
+never will, and that is deliberate: the refresh grant rotates the refresh token,
+and a botched write to the shared keychain item would invalidate your Claude
+Code login. Breaking the CLI to keep a menu bar gauge current is a bad trade.
 
-This is deliberate. Implementing the refresh grant means handling a rotating
-refresh token, and getting it wrong risks invalidating your CLI login. If the
-manual step becomes annoying, the honest fix is to test the refresh endpoint
-carefully first — not to guess at it.
+Instead the widget is built so an expired token costs nothing and repairs
+itself:
+
+| Stage | Behaviour |
+|---|---|
+| Before every request | Reads `expiresAt` from the keychain blob it already parses. An expired token means **no request is sent at all** — 60s of slack, since a token dying mid-flight returns 401 anyway |
+| On a 401 it couldn't predict | Stops polling entirely and records which token died. A revoked token is not staleness, and retrying only rebuilds the pile |
+| Every tick while stopped | Re-reads the keychain — local, no network — and resumes the moment it holds a **different** valid token |
+| Repair | Run `claude` for any reason. Claude Code rewrites the token, and the widget picks it up within 15 minutes on its own |
+
+This matters because of how the endpoint actually fails. It rate limits **failed
+authentication**, and every 429 comes back with a flat `Retry-After: 3600`
+regardless of time already served — so retries reset the hour rather than
+shorten it. A handful of 401s from an expired token is enough to trigger it. The
+whole design above exists to make that sequence impossible:
+
+```
+expired token -> 401 -> 401 -> 401 -> 401 -> 429 for an hour
+```
+
+If it ever happens anyway, `failures.log` records the status, `Retry-After` and
+body of every failure — read it before theorising.
 
 ### Why Objective-C
 

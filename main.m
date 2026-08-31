@@ -899,6 +899,8 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     BOOL                  _serverAsked;  // the wait came from Retry-After, not us
     BOOL                  _authExpired;  // 401 seen; polling on is pointless and harmful
     BOOL                  _fromClaudeCode;  // showing Claude Code's cache, not ours
+    NSDate               *_deadTokenExpiry;  // expiry of the token that failed auth
+    NSDate               *_sentTokenExpiry;  // expiry of the token now in flight
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -1044,12 +1046,26 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         return;
     }
 
-    // Backstop for a 401 the expiry check could not predict — a revoked token,
-    // or a blob with no expiresAt. The expiry check below is the primary
-    // defence; this catches what it cannot see.
-    if (_authExpired && !forced) {
-        [self renderState:UsageStateExpired limits:@[] message:nil];
-        return;
+    // Heal without being asked.
+    //
+    // Claude Code rewrites this token every time it runs, so the repair for an
+    // expired token is something the user does for their own reasons and should
+    // not have to tell us about. Re-read the keychain — local, no network — and
+    // resume the moment it holds a *different* token.
+    //
+    // Different, not merely valid: if the same token keeps failing, the problem
+    // is not staleness but revocation or the wrong account, and retrying would
+    // rebuild exactly the pile of 401s that earns an hour-long 429.
+    if (_authExpired) {
+        OAuthToken *current = ReadOAuthToken();
+        BOOL renewed = current.value.length > 0 && ![current isExpired] &&
+                       current.expires != nil &&
+                       ![current.expires isEqualToDate:_deadTokenExpiry];
+        if (!renewed && !forced) {
+            [self renderState:UsageStateExpired limits:@[] message:nil];
+            return;
+        }
+        _authExpired = NO;
     }
     if (!forced && _lastSuccess && [now timeIntervalSinceDate:_lastSuccess] < kFreshnessWindow) {
         return;  // recent enough — leave the UI as it is, make no request
@@ -1067,11 +1083,13 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     // regardless of how the failures were earned. Costs one local keychain
     // read; saves the lockout entirely.
     if (token.isExpired) {
-        _authExpired = YES;
+        _authExpired     = YES;
+        _deadTokenExpiry = token.expires;
         [self renderState:UsageStateExpired limits:@[] message:nil];
         return;
     }
-    _authExpired = NO;   // a fresh token means the last failure is behind us
+    _authExpired     = NO;   // a fresh token means the last failure is behind us
+    _sentTokenExpiry = token.expires;
 
     [self markInFlight:YES];
 
@@ -1127,7 +1145,9 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         }
         if (code == 401 || code == 403) {
             LogFailure(code, http, data, @"usage");
-            strong->_authExpired = YES;
+            strong->_authExpired     = YES;
+            // Remember which token died, so a later one is recognised as new.
+            strong->_deadTokenExpiry = strong->_sentTokenExpiry;
             [strong renderState:UsageStateExpired limits:@[] message:nil];
             return;
         }
