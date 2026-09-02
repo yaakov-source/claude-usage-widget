@@ -634,6 +634,51 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
     return row;
 }
 
+/// One click instead of a remembered command. The widget cannot renew the
+/// token itself — see the README on why refreshing it here could invalidate the
+/// user's CLI login — but it can start the thing that does.
+- (NSView *)fixItButton {
+    NSView *row = [[NSView alloc] initWithFrame:NSZeroRect];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSButton *fix = [NSButton buttonWithTitle:@"Open Terminal and run claude"
+                                       target:self action:@selector(runClaudeTapped)];
+    fix.bezelStyle  = NSBezelStyleRounded;
+    fix.controlSize = NSControlSizeSmall;
+    fix.font        = [NSFont systemFontOfSize:11];
+    fix.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:fix];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [fix.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [fix.topAnchor     constraintEqualToAnchor:row.topAnchor],
+        [fix.bottomAnchor  constraintEqualToAnchor:row.bottomAnchor],
+        [fix.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor],
+    ]];
+    return row;
+}
+
+- (void)runClaudeTapped {
+    NSString *script = @"tell application \"Terminal\"\n"
+                        "activate\n"
+                        "do script \"claude\"\n"
+                        "end tell";
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+    task.arguments = @[@"-e", script];
+    [task launchAndReturnError:NULL];
+    // The keychain write lands when Claude Code finishes starting; the timer
+    // picks it up, and this makes it feel immediate rather than eventual.
+    if (self.onRefresh) {
+        __weak UsageViewController *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UsageViewController *strong = weakSelf;
+            if (strong.onRefresh) strong.onRefresh();
+        });
+    }
+}
+
 - (NSView *)footerBlock {
     NSView *footer = [[NSView alloc] initWithFrame:NSZeroRect];
     footer.translatesAutoresizingMaskIntoConstraints = NO;
@@ -717,7 +762,9 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
             break;
         case UsageStateExpired:
             [self addRow:[self messageBlock:
-                @"Token expired.\nRun `claude` in Terminal once to refresh it, then refresh here."]];
+                @"Your Claude Code sign-in expired. It lasts about 8 hours; the "
+                 "widget can read it but cannot renew it."]];
+            [self addRow:[self fixItButton]];
             break;
         case UsageStateError:
             [self addRow:[self messageBlock:(self.message ?: @"Something went wrong.")]];
@@ -809,6 +856,7 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
 - (void)markInFlight:(BOOL)flag;
 - (void)backOffAfter:(NSInteger)code http:(NSHTTPURLResponse *)http;
 - (NSString *)waitNote;
+- (NSString *)offlineNote;
 - (void)cacheResponse:(NSData *)data;
 - (BOOL)loadCachedResponse;
 @end
@@ -901,6 +949,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     BOOL                  _fromClaudeCode;  // showing Claude Code's cache, not ours
     NSDate               *_deadTokenExpiry;  // expiry of the token that failed auth
     NSDate               *_sentTokenExpiry;  // expiry of the token now in flight
+    NSDate               *_lastTransientLog; // rate limits our own logging
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
@@ -997,6 +1046,51 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
 
 #pragma mark Networking
 
+/// The shared session fails immediately when the interface is down, which on a
+/// laptop means every wake, every wifi handover and every VPN flap produces a
+/// timeout. `waitsForConnectivity` makes URLSession hold the request until
+/// there is a route instead — the machine reconnects, the request goes out, and
+/// nothing is logged or shown. The long resource timeout is what gives it room
+/// to do that; the per-request timeout still bounds a connection that stalls
+/// after it opens.
+- (NSURLSession *)session {
+    static NSURLSession *shared = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURLSessionConfiguration *config =
+            [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        config.waitsForConnectivity        = YES;
+        config.timeoutIntervalForRequest   = 30;
+        config.timeoutIntervalForResource  = 300;   // room to wait out a wake
+        config.HTTPShouldUsePipelining     = NO;
+        shared = [NSURLSession sessionWithConfiguration:config];
+    });
+    return shared;
+}
+
+/// Transient plumbing — asleep, offline, wifi mid-handover, a TLS handshake
+/// that lost its connection. Not the server's answer and not the user's
+/// problem, so these never produce an alarming note: the numbers stay put and
+/// the footnote just says how old they are.
+static BOOL IsTransientNetworkError(NSError *error) {
+    if (![error.domain isEqualToString:NSURLErrorDomain]) return NO;
+    switch (error.code) {
+        case NSURLErrorTimedOut:
+        case NSURLErrorNotConnectedToInternet:
+        case NSURLErrorNetworkConnectionLost:
+        case NSURLErrorCannotConnectToHost:
+        case NSURLErrorCannotFindHost:
+        case NSURLErrorDNSLookupFailed:
+        case NSURLErrorInternationalRoamingOff:
+        case NSURLErrorCallIsActive:
+        case NSURLErrorDataNotAllowed:
+        case NSURLErrorSecureConnectionFailed:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
 - (void)request:(NSString *)urlString
           token:(NSString *)token
            done:(void (^)(NSInteger code, NSData *data, NSError *error,
@@ -1014,7 +1108,7 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     [req setValue:@"ClaudeUsageBar/1.0" forHTTPHeaderField:@"User-Agent"];
 
     NSURLSessionDataTask *task =
-        [[NSURLSession sharedSession] dataTaskWithRequest:req
+        [[self session] dataTaskWithRequest:req
                                         completionHandler:^(NSData *data,
                                                             NSURLResponse *response,
                                                             NSError *error) {
@@ -1138,6 +1232,18 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         [strong markInFlight:NO];   // end of the chain, whatever happened
 
         if (error) {
+            if (IsTransientNetworkError(error)) {
+                // Log at most one of these an hour: eleven identical timeouts
+                // overnight is noise that buries the lines worth reading.
+                NSDate *last = strong->_lastTransientLog;
+                if (!last || -[last timeIntervalSinceNow] > 3600) {
+                    LogFailure(0, http, nil,
+                               [@"transient: " stringByAppendingString:error.localizedDescription]);
+                    strong->_lastTransientLog = [NSDate date];
+                }
+                [strong renderDegradedWithNote:[strong offlineNote]];
+                return;
+            }
             LogFailure(0, http, nil, error.localizedDescription);
             [strong renderDegradedWithNote:[NSString stringWithFormat:@"Network error: %@",
                                             error.localizedDescription]];
@@ -1260,6 +1366,15 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     } else {
         [self renderState:UsageStateError limits:@[] message:note];
     }
+}
+
+/// What the popover says when the network, not the server, is the problem.
+- (NSString *)offlineNote {
+    if (_dataAsOf) {
+        return [NSString stringWithFormat:@"Offline — showing values from %@. Will retry.",
+                AgeText(_dataAsOf)];
+    }
+    return @"Offline — will retry when the connection is back.";
 }
 
 - (NSString *)waitNote {

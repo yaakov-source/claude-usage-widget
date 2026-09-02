@@ -145,6 +145,19 @@ Two things worth knowing about that Keychain item:
 The reader also hex-decodes the blob if `security` returns hex instead of text,
 which it does when the stored value isn't printable UTF-8.
 
+### Network failures
+
+Laptops sleep, wifi hands over, VPNs flap. The shared `NSURLSession` fails
+instantly when the interface is down, which produced a steady drip of
+`The request timed out` and `The Internet connection appears to be offline` —
+eleven in one night — each one surfacing a raw error string in the popover.
+
+The widget uses its own session with `waitsForConnectivity`, so URLSession holds
+the request until there is a route rather than failing at one. Transient errors
+(timeout, offline, connection lost, DNS, TLS handshake) keep the last numbers on
+screen under a plain *"Offline — showing values from 2 hr ago"*, and are logged
+at most once an hour so they don't bury the lines worth reading.
+
 ### Rate limiting
 
 The endpoint returns **429** if polled casually, and it does not take much to
@@ -189,7 +202,12 @@ itself:
 | Before every request | Reads `expiresAt` from the keychain blob it already parses. An expired token means **no request is sent at all** — 60s of slack, since a token dying mid-flight returns 401 anyway |
 | On a 401 it couldn't predict | Stops polling entirely and records which token died. A revoked token is not staleness, and retrying only rebuilds the pile |
 | Every tick while stopped | Re-reads the keychain — local, no network — and resumes the moment it holds a **different** valid token |
-| Repair | Run `claude` for any reason. Claude Code rewrites the token, and the widget picks it up within 15 minutes on its own |
+| Repair | Click **Open Terminal and run claude** in the popover, or run `claude` for any reason. Claude Code rewrites the token and the widget picks it up |
+
+Neither `claude --version` nor `claude mcp list` refreshes the token — both were
+tested and left the keychain item untouched — so the widget cannot renew it by
+shelling out to something cheap. Starting an interactive session is what writes
+a new one, which is why the button does that.
 
 This matters because of how the endpoint actually fails. It rate limits **failed
 authentication**, and every 429 comes back with a flat `Retry-After: 3600`
