@@ -247,6 +247,79 @@ than showing the user a raw error body.
 
 ---
 
+## 10. The token died every 8 hours, and I kept treating that as unfixable
+
+**[me]**
+
+**Symptom.** The widget went stale roughly once a day. Each time it looked
+different — "rate limited," a wall of timeouts, then "token expired" — and each
+time I fixed the thing on screen.
+
+**Cause.** One thing, wearing four costumes. The OAuth access token lasts about
+8 hours and only Claude Code renewed it. Every request with the dead token was
+a 401; the server rate limits failed auth, so a few 401s bought a one-hour 429
+with a flat `Retry-After: 3600` that reset on every retry. The timeouts were a
+separate, real problem (the shared `NSURLSession` fails instantly when the
+interface is down) that happened to land on the same days.
+
+**Where I went wrong.** Section 9 and the README both said "the widget will
+never refresh the token — the refresh grant rotates the refresh token and a bad
+write would break the CLI login." I treated that as a wall and built four layers
+of workaround against it: never send an expired token, stop polling after a
+401, persist the cooldown across launches, watch the keychain for a new token,
+then a one-click button that opened Terminal to run `claude` for you. Each one
+was correct and none of them was the fix. The user's question — *"if I get
+OAuth, is it fixed?"* — was the right one, and the honest answer was yes.
+
+**Fix.** Do exactly what Claude Code does, lifted from its installed binary
+rather than guessed: same token endpoint, same client id, same request body,
+same merge into the same keychain item with the same `security -i` hex write.
+Back the item up to a second keychain entry first. That symmetry is the whole
+safety argument, and the "rotation risk" was only a risk if the write-back was
+improvised. Twenty-nine offline tests cover the parse, the merge (rotation,
+`mcpOAuth` sibling preserved byte-for-byte), and the exact script format.
+
+**Lesson.** "Deliberately not implemented" deserves a second look once the
+workarounds outnumber the thing they're working around. Four layers is the
+signal.
+
+### 10a. And then the first write-back corrupted the credential
+
+**[me]**
+
+**Symptom.** Renewal succeeded — fresh token, live numbers — and on the next
+relaunch the widget said *No Claude token found*. Claude Code was signed out
+too.
+
+**Cause.** `security -i` reads one command per line through a fixed buffer.
+The blob, hex-encoded, was ~10 KB — past it. The head of the line ran as a real
+`add-generic-password` with a truncated value; the tail came back as *unknown
+command*. So the item was overwritten with the first 2 KB of the JSON, and the
+"backup" taken a moment earlier was written the same way and was equally
+useless. Claude Code's own code guards exactly this: `if (script.length <= H)
+use -i, else pass the value in argv`, with a log line saying so. I copied the
+`-i` branch and not the guard.
+
+Worse: the failure handler logged `security`'s stderr verbatim, and stderr
+echoes the offending command — payload included. The renewed tokens landed in
+`failures.log` in hex. Scrubbed, and the file is 0600 now.
+
+**Fix.** Mirror the guard: stdin under 2 000 characters, argv above it. Read the
+item straight back after every write and refuse to report success unless it is
+byte-identical to what was sent — a quiet mismatch is the one failure this must
+never have. Redact hex runs and `sk-ant-…` tokens from anything that reaches
+the log, whatever the caller passed. Verified live against a throwaway keychain
+service: small payload via stdin, 5 KB payload via argv, byte-identical read-back
+on both, overwrite in place, probe deleted.
+
+**Recovery.** Sign in again with `claude`; it rewrites the item cleanly.
+
+**Lesson.** When copying another program's write path, copy its *guards*, not
+just its happy path — the guard is where it learned the same lesson. And a
+backup taken with the same broken tool is not a backup.
+
+---
+
 ## Summary of what I'd do differently
 
 1. **Verify the credential exists before designing the auth strategy.** One
@@ -262,3 +335,6 @@ than showing the user a raw error body.
 5. **Parse structured output with a parser.** Not with `grep -B8`.
 6. **Budget requests to an undocumented endpoint like they're scarce.** They
    are. And always degrade to stale data rather than an error wall.
+7. **Revisit "deliberately not implemented" once the workarounds pile up.**
+   Four defensive layers against token expiry were four signs the real fix was
+   token renewal. Copy the other app's write exactly instead of ruling it out.

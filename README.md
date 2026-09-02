@@ -187,40 +187,58 @@ If you trip it anyway — usually by running the diagnostic probes repeatedly �
 the only fix is to stop calling and wait. No client-side change makes a
 rate-limited server answer sooner.
 
-### Token expiry
+### Token expiry and renewal
 
-Access tokens last roughly 8 hours. **The widget does not refresh them.** It
-never will, and that is deliberate: the refresh grant rotates the refresh token,
-and a botched write to the shared keychain item would invalidate your Claude
-Code login. Breaking the CLI to keep a menu bar gauge current is a bad trade.
+Access tokens last roughly 8 hours. **The widget renews them itself**, the same
+way Claude Code does, using the `refreshToken` stored beside the access token in
+the same keychain item.
 
-Instead the widget is built so an expired token costs nothing and repairs
-itself:
+An earlier version of this README ruled that out as too risky. It was wrong
+about the risk and right about the standard: touching a credential two apps
+share is only safe if you do *exactly* what the other app does. So the flow is
+lifted verbatim from the installed Claude Code binary rather than guessed at:
 
-| Stage | Behaviour |
+| Step | What happens |
 |---|---|
-| Before every request | Reads `expiresAt` from the keychain blob it already parses. An expired token means **no request is sent at all** — 60s of slack, since a token dying mid-flight returns 401 anyway |
-| On a 401 it couldn't predict | Stops polling entirely and records which token died. A revoked token is not staleness, and retrying only rebuilds the pile |
-| Every tick while stopped | Re-reads the keychain — local, no network — and resumes the moment it holds a **different** valid token |
-| Repair | Click **Open Terminal and run claude** in the popover, or run `claude` for any reason. Claude Code rewrites the token and the widget picks it up |
+| Detect | `expiresAt` is read from the blob before every request. An expired token is **never sent to the usage endpoint** — that's a 401, and enough 401s are a flat one-hour 429 |
+| Renew | `POST https://platform.claude.com/v1/oauth/token` with `{grant_type: refresh_token, refresh_token, client_id, scope}` — Claude Code's own endpoint, client id, and body |
+| Merge | The response is folded into the stored blob the way Claude Code folds it: new `accessToken` and `expiresAt`, the refresh token replaced only if the server rotated it, and **every other key carried through untouched** — including the `mcpOAuth` tokens Claude Code keeps beside it |
+| Back up | Before writing, the item as it stood is copied to a second keychain entry, `ClaudeUsageBar-credentials-backup` |
+| Write | `security -i` with `add-generic-password -U -a <acct> -s "Claude Code-credentials" -X <hex>` — the same tool, same item, same hex encoding Claude Code uses, so the item is updated in place and its existing access control applies |
+| Use | The renewed token fetches usage immediately. A failed write is logged, not fatal: the token still works for this session and Claude Code renews its own copy next time it runs |
 
-Neither `claude --version` nor `claude mcp list` refreshes the token — both were
-tested and left the keychain item untouched — so the widget cannot renew it by
-shelling out to something cheap. Starting an interactive session is what writes
-a new one, which is why the button does that.
+A renewal that fails outright (`invalid_grant` — the refresh token itself is
+dead, usually because you signed out) is not retried on the timer. The popover
+says so and offers **Open Terminal and run claude**; signing in again fixes it,
+and the widget notices the new credential on its own.
 
-This matters because of how the endpoint actually fails. It rate limits **failed
-authentication**, and every 429 comes back with a flat `Retry-After: 3600`
-regardless of time already served — so retries reset the hour rather than
-shorten it. A handful of 401s from an expired token is enough to trigger it. The
-whole design above exists to make that sequence impossible:
+**Undo.** If a write ever goes wrong, the pre-write blob is one command away:
+
+```
+security add-generic-password -U -a "$USER" -s "Claude Code-credentials" \
+  -w "$(security find-generic-password -s ClaudeUsageBar-credentials-backup -w)"
+```
+
+(`-a` must match the item's account attribute, which is normally your username.)
+
+The backup is only as good as the write that made it, so every write is also
+read straight back and compared byte-for-byte; a mismatch is reported as a
+failure, never as success. If both the item and the backup are ever unreadable,
+signing in again with `claude` rewrites the item cleanly — that is the true
+fallback, and it takes about thirty seconds.
+
+Why it matters: the endpoint rate limits **failed authentication**, and every
+429 comes back with a flat `Retry-After: 3600` regardless of time already served,
+so retries reset the hour rather than shorten it. Renewing the token before it
+is ever sent makes the whole sequence impossible:
 
 ```
 expired token -> 401 -> 401 -> 401 -> 401 -> 429 for an hour
 ```
 
 If it ever happens anyway, `failures.log` records the status, `Retry-After` and
-body of every failure — read it before theorising.
+body of every failure — including renewal attempts, tagged `renew` — read it
+before theorising.
 
 ### Why Objective-C
 
@@ -302,6 +320,9 @@ Nothing is hard-coded to one account — no UUIDs, no tokens, no paths outside
   make itself easy to fit. `defaults write com.haicreative.claudeusagebar
   MenuBarStyle gauge` restores the battery, `icon` gives the battery alone.
 - **Undocumented endpoint.** See above.
-- **No token refresh.** See above.
+- **Shares a credential with Claude Code.** Renewal writes to the same keychain
+  item Claude Code reads. It mirrors Claude Code's own write exactly and backs
+  the item up first, but it is still two programs holding one secret — see
+  *Token expiry and renewal* for the undo.
 - **Unsigned.** Ad-hoc signed at build time. Fine for a locally built app; it
   would need a Developer ID and notarization to distribute to others.

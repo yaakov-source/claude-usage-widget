@@ -16,6 +16,17 @@
 
 static NSString *const kUsageURL   = @"https://api.anthropic.com/api/oauth/usage";
 static NSString *const kProfileURL = @"https://api.anthropic.com/api/oauth/profile";
+
+// Token renewal. Both values are lifted verbatim from the installed Claude Code
+// binary (2.1.251): its refresh is POST {grant_type, refresh_token, client_id,
+// scope} as JSON to TOKEN_URL, and it stores the result back into the same
+// keychain item via `security -i` with a hex-encoded payload. Doing exactly
+// what it does — same item, same field names, same encoding — is what makes
+// sharing the credential safe.
+static NSString *const kTokenURL      = @"https://platform.claude.com/v1/oauth/token";
+static NSString *const kClientID      = @"9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+static NSString *const kBackupService = @"ClaudeUsageBar-credentials-backup";
+static NSString *const kDefaultScope  = @"user:profile user:inference";
 // Deliberately conservative. This endpoint is internal and rate limited; it is
 // not built for polling. Opening the popover reuses data under 60s old rather
 // than making a request.
@@ -140,13 +151,25 @@ static NSString *DecodeHex(NSString *s) {
 /// earns a 401, and enough 401s earn a 429 with a flat one-hour Retry-After —
 /// the server rate limits failed auth. Knowing the token is dead *before*
 /// spending a request means that cascade can never start.
-@interface OAuthToken : NSObject
-@property (nonatomic, copy)   NSString *value;
-@property (nonatomic, strong) NSDate   *expires;   // nil when the blob omits it
+///
+/// And reading `refreshToken` is what makes the widget self-sufficient. An
+/// expired access token is renewed the way Claude Code renews it, and the
+/// result goes back into the same keychain item, so both apps keep working
+/// from one credential. The whole stored blob is kept, not just the OAuth
+/// fields: Claude Code keeps MCP server tokens beside them, and a write that
+/// dropped those would break something unrelated to us.
+@interface Credentials : NSObject
+@property (nonatomic, strong) NSMutableDictionary *blob;   // entire stored JSON
+@property (nonatomic, copy)   NSString *accessToken;
+@property (nonatomic, copy)   NSString *refreshToken;        // nil when absent
+@property (nonatomic, strong) NSDate   *expires;             // nil when absent
+@property (nonatomic, copy)   NSString *scope;               // space-separated
+@property (nonatomic, copy)   NSString *service;             // keychain svc; nil = file
+@property (nonatomic, copy)   NSString *account;             // keychain acct
 - (BOOL)isExpired;
 @end
 
-@implementation OAuthToken
+@implementation Credentials
 /// A minute of slack: a token expiring while the request is in flight comes
 /// back as a 401 just the same.
 - (BOOL)isExpired {
@@ -154,41 +177,89 @@ static NSString *DecodeHex(NSString *s) {
 }
 @end
 
-static NSDate *ExpiryFrom(id value) {
-    if (![value isKindOfClass:[NSNumber class]]) return nil;
-    double n = [value doubleValue];
-    if (n <= 0) return nil;
-    return [NSDate dateWithTimeIntervalSince1970:(n > 1e12 ? n / 1000.0 : n)];
+static NSNumber *Numeric(id value) {
+    return [value isKindOfClass:[NSNumber class]] ? value : nil;
 }
 
-static OAuthToken *TokenFromJSONText(NSString *text) {
+static NSDate *ExpiryFrom(id value) {
+    NSNumber *n = Numeric(value);
+    if (!n || [n doubleValue] <= 0) return nil;
+    double v = [n doubleValue];
+    return [NSDate dateWithTimeIntervalSince1970:(v > 1e12 ? v / 1000.0 : v)];
+}
+
+/// Which dictionary carries the OAuth fields: `claudeAiOauth` in the keychain
+/// blob, or the top level in the legacy credentials file. nil for anything
+/// else — which is how the `mcpOAuth`-only decoy items are rejected.
+static NSString *OAuthContainerKey(NSDictionary *blob) {
+    id inner = blob[@"claudeAiOauth"];
+    if ([inner isKindOfClass:[NSDictionary class]] &&
+        [((NSDictionary *)inner)[@"accessToken"] isKindOfClass:[NSString class]]) {
+        return @"claudeAiOauth";
+    }
+    if ([blob[@"accessToken"] isKindOfClass:[NSString class]]) return @"";
+    return nil;
+}
+
+static Credentials *CredentialsFromJSONText(NSString *text) {
     if (text.length == 0) return nil;
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     if (!data) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+    id obj = [NSJSONSerialization JSONObjectWithData:data
+                                             options:NSJSONReadingMutableContainers
+                                               error:NULL];
     if (![obj isKindOfClass:[NSDictionary class]]) return nil;
 
-    NSDictionary *dict = obj;
-    NSDictionary *source = nil;
-    id inner = dict[@"claudeAiOauth"];
-    if ([inner isKindOfClass:[NSDictionary class]] &&
-        [((NSDictionary *)inner)[@"accessToken"] isKindOfClass:[NSString class]]) {
-        source = inner;
-    } else if ([dict[@"accessToken"] isKindOfClass:[NSString class]]) {
-        source = dict;
-    }
-    if (!source) return nil;
+    NSMutableDictionary *blob = obj;
+    NSString *key = OAuthContainerKey(blob);
+    if (!key) return nil;
+    NSDictionary *o = key.length ? blob[key] : blob;
 
-    NSString *value = source[@"accessToken"];
-    if (value.length == 0) return nil;
+    NSString *access = o[@"accessToken"];
+    if (access.length == 0) return nil;
 
-    OAuthToken *token = [[OAuthToken alloc] init];
-    token.value   = value;
-    token.expires = ExpiryFrom(source[@"expiresAt"]);
-    return token;
+    Credentials *c = [[Credentials alloc] init];
+    c.blob        = blob;
+    c.accessToken = access;
+    id refresh = o[@"refreshToken"];
+    c.refreshToken = ([refresh isKindOfClass:[NSString class]] && [refresh length]) ? refresh : nil;
+    c.expires     = ExpiryFrom(o[@"expiresAt"]);
+    id scopes = o[@"scopes"];
+    c.scope = ([scopes isKindOfClass:[NSArray class]] && [scopes count])
+              ? [(NSArray *)scopes componentsJoinedByString:@" "]
+              : kDefaultScope;
+    return c;
 }
 
-static OAuthToken *ReadOAuthToken(void) {
+/// The `acct` attribute of the keychain item, needed to write it back.
+/// `security` prints it as "acct"<blob>="text", or as 0x-prefixed hex when it
+/// isn't plain ASCII.
+static NSString *KeychainAccount(NSString *service) {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
+    task.arguments = @[@"find-generic-password", @"-s", service];
+    NSPipe *out = [NSPipe pipe];
+    task.standardOutput = out;
+    task.standardError = [NSPipe pipe];
+    if (![task launchAndReturnError:NULL]) return nil;
+    NSData *data = [out.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) return nil;
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"\"acct\"<blob>=(?:\"((?:[^\"\\\\]|\\\\.)*)\"|0x([0-9A-Fa-f]+))" options:0 error:NULL];
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0
+                                               range:NSMakeRange(0, text.length)];
+    if (!m) return nil;
+    if ([m rangeAtIndex:1].location != NSNotFound) {
+        return [[text substringWithRange:[m rangeAtIndex:1]]
+                stringByReplacingOccurrencesOfString:@"\\\"" withString:@"\""];
+    }
+    return DecodeHex([text substringWithRange:[m rangeAtIndex:2]]);
+}
+
+static Credentials *ReadCredentials(void) {
     NSArray *services = @[@"Claude Code-credentials", @"Claude Code"];
     for (NSString *service in services) {
         NSString *raw = RunSecurity(service);
@@ -201,13 +272,154 @@ static OAuthToken *ReadOAuthToken(void) {
             NSString *decoded = DecodeHex(raw);
             if (decoded) raw = decoded;
         }
-        OAuthToken *token = TokenFromJSONText(raw);
-        if (token) return token;
+        Credentials *c = CredentialsFromJSONText(raw);
+        if (c) {
+            c.service = service;
+            c.account = KeychainAccount(service);
+            return c;
+        }
     }
 
     NSString *path = [@"~/.claude/.credentials.json" stringByExpandingTildeInPath];
     NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
-    return TokenFromJSONText(text);
+    return CredentialsFromJSONText(text);   // service stays nil: file-backed
+}
+
+#pragma mark - Credential write-back
+
+static NSString *HexEncode(NSData *data) {
+    const unsigned char *b = data.bytes;
+    NSMutableString *hex = [NSMutableString stringWithCapacity:data.length * 2];
+    for (NSUInteger i = 0; i < data.length; i++) [hex appendFormat:@"%02x", b[i]];
+    return hex;
+}
+
+/// Exactly Claude Code's own write: one `add-generic-password -U` line fed to
+/// `security -i` on stdin, payload hex-encoded so quoting can never bite. Same
+/// account and service, so the item is updated rather than duplicated and its
+/// existing access control applies unchanged. Pure, so it can be tested.
+static NSString *KeychainWriteScript(NSString *service, NSString *account, NSString *json) {
+    return [NSString stringWithFormat:@"add-generic-password -U -a \"%@\" -s \"%@\" -X \"%@\" \n",
+            account, service, HexEncode([json dataUsingEncoding:NSUTF8StringEncoding])];
+}
+
+/// Never let credential material reach a log. `security` echoes the offending
+/// command back in its error text, and the command carries the whole payload.
+static NSString *RedactHex(NSString *s) {
+    if (s.length == 0) return @"";
+    static NSRegularExpression *hexRun = nil, *token = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Hex payloads echoed back by `security`, and Anthropic-shaped tokens
+        // (sk-ant-oat01-…, sk-ant-ort01-…) should they ever land in a body.
+        hexRun = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-fA-F]{32,}"
+                                                            options:0 error:NULL];
+        token  = [NSRegularExpression regularExpressionWithPattern:@"sk-ant-[A-Za-z0-9_-]{8,}"
+                                                            options:0 error:NULL];
+    });
+    NSString *out = [hexRun stringByReplacingMatchesInString:s options:0
+                                                       range:NSMakeRange(0, s.length)
+                                                withTemplate:@"<hex redacted>"];
+    out = [token stringByReplacingMatchesInString:out options:0
+                                            range:NSMakeRange(0, out.length)
+                                     withTemplate:@"<token redacted>"];
+    return out.length > 300 ? [out substringToIndex:300] : out;
+}
+
+/// `security -i` reads one command per line through a fixed buffer. A line
+/// past it is split: the head runs with a truncated value and the tail is
+/// rejected as unknown commands — which writes a corrupt item and reports a
+/// failure. Claude Code guards this with a length check and falls back to
+/// passing the value in argv; so does this. The stdin path is used only when
+/// it is certainly safe.
+static const NSUInteger kSecurityStdinLimit = 2000;
+
+static BOOL WriteKeychainItem(NSString *service, NSString *account, NSString *json,
+                              NSString **failure) {
+    NSString *hex    = HexEncode([json dataUsingEncoding:NSUTF8StringEncoding]);
+    NSString *script = KeychainWriteScript(service, account, json);
+    BOOL viaStdin    = script.length <= kSecurityStdinLimit;
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
+    task.arguments = viaStdin
+        ? @[@"-i"]
+        : @[@"add-generic-password", @"-U", @"-a", account, @"-s", service, @"-X", hex];
+    NSPipe *in = [NSPipe pipe], *err = [NSPipe pipe];
+    task.standardInput  = viaStdin ? in : [NSFileHandle fileHandleWithNullDevice];
+    task.standardOutput = [NSPipe pipe];
+    task.standardError  = err;
+
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        if (failure) *failure = launchError.localizedDescription ?: @"could not run security";
+        return NO;
+    }
+    if (viaStdin) {
+        [in.fileHandleForWriting writeData:[script dataUsingEncoding:NSUTF8StringEncoding]];
+        [in.fileHandleForWriting closeFile];
+    }
+    NSData *errData = [err.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+
+    if (task.terminationStatus != 0) {
+        NSString *msg = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
+        if (failure) *failure = [NSString stringWithFormat:@"security exited %d: %@",
+                                 task.terminationStatus, RedactHex(msg)];
+        return NO;
+    }
+
+    // Read it straight back. A write that "succeeded" but stored something
+    // other than what we sent is the one failure this must never be quiet
+    // about — it is exactly how the item got corrupted once already.
+    NSString *back = [RunSecurity(service) stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (back.length && ![back hasPrefix:@"{"] && IsHexString(back)) back = DecodeHex(back);
+    if (![back isEqualToString:json]) {
+        if (failure) *failure = @"read-back mismatch: stored item differs from what was written";
+        return NO;
+    }
+    return YES;
+}
+
+/// The stored blob with a token response folded in, the way Claude Code folds
+/// it: the OAuth container gets the new access token and expiry, keeps its
+/// refresh token unless the server rotated it, and every other key — theirs
+/// and ours — is carried through untouched. Pure, so it can be tested without
+/// a keychain.
+static NSDictionary *MergeRefreshResponse(NSDictionary *blob, NSDictionary *response, NSDate *now) {
+    NSString *key = OAuthContainerKey(blob);
+    if (!key) return nil;
+    NSString *access = response[@"access_token"];
+    NSNumber *expiresIn = Numeric(response[@"expires_in"]);
+    if (![access isKindOfClass:[NSString class]] || access.length == 0 || !expiresIn) return nil;
+
+    NSMutableDictionary *out = [blob mutableCopy];
+    NSMutableDictionary *o = [(key.length ? blob[key] : blob) mutableCopy];
+
+    o[@"accessToken"] = access;
+    o[@"expiresAt"]   = @((long long)(([now timeIntervalSince1970] + [expiresIn doubleValue]) * 1000.0));
+
+    NSString *rotated = response[@"refresh_token"];
+    if ([rotated isKindOfClass:[NSString class]] && rotated.length) o[@"refreshToken"] = rotated;
+
+    NSNumber *rtExpiresIn = Numeric(response[@"refresh_token_expires_in"]);
+    if (rtExpiresIn) {
+        o[@"refreshTokenExpiresAt"] =
+            @((long long)(([now timeIntervalSince1970] + [rtExpiresIn doubleValue]) * 1000.0));
+    }
+    NSString *scope = response[@"scope"];
+    if ([scope isKindOfClass:[NSString class]] && scope.length) {
+        o[@"scopes"] = [scope componentsSeparatedByString:@" "];
+    }
+
+    if (key.length) out[key] = o; else [out addEntriesFromDictionary:o];
+    return out;
+}
+
+static NSString *JSONText(id obj) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:NULL];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
 }
 
 #pragma mark - Parsing
@@ -247,10 +459,6 @@ static NSString *Prettify(NSString *key) {
     if (spaced.length == 0) return spaced;
     return [[[spaced substringToIndex:1] uppercaseString]
             stringByAppendingString:[spaced substringFromIndex:1]];
-}
-
-static NSNumber *Numeric(id value) {
-    return [value isKindOfClass:[NSNumber class]] ? value : nil;
 }
 
 static NSArray<LimitInfo *> *ParseLimits(id root) {
@@ -761,9 +969,12 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
                 @"No Claude token found.\nRun `claude` in Terminal and sign in, then refresh."]];
             break;
         case UsageStateExpired:
-            [self addRow:[self messageBlock:
-                @"Your Claude Code sign-in expired. It lasts about 8 hours; the "
-                 "widget can read it but cannot renew it."]];
+            [self addRow:[self messageBlock:(self.message.length
+                ? [NSString stringWithFormat:
+                   @"Sign-in expired and couldn't be renewed automatically (%@). "
+                    "Signing in again fixes it.", self.message]
+                : @"Sign-in expired and couldn't be renewed automatically. "
+                   "Signing in again fixes it.")]];
             [self addRow:[self fixItButton]];
             break;
         case UsageStateError:
@@ -848,6 +1059,12 @@ static NSImage *GaugeImage(NSNumber *fraction, NSGradient *fill) {
 @interface AppDelegate ()
 - (void)refreshForced:(BOOL)forced;
 - (void)fetchUsageWithToken:(NSString *)token;
+- (void)continueWithCredentials:(Credentials *)creds;
+- (void)renewCredentials:(Credentials *)creds
+                    then:(void (^)(Credentials *fresh, NSString *failure, BOOL transient))done;
+- (BOOL)renewalAlreadyFailedFor:(Credentials *)creds;
+- (void)rememberRenewalFailedFor:(Credentials *)creds;
+- (void)clearRenewalFailure;
 - (void)renderState:(UsageState)state
              limits:(NSArray<LimitInfo *> *)limits
             message:(NSString *)message;
@@ -912,10 +1129,13 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
         snippet = [snippet stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
     }
 
+    // Belt and braces: nothing that looks like a token or a hex payload goes
+    // in, whatever the caller passed.
     NSISO8601DateFormatter *stamp = [[NSISO8601DateFormatter alloc] init];
     NSString *line = [NSString stringWithFormat:@"%@\tHTTP %ld\t%@\tretry-after=%@\t%@\n",
-                      [stamp stringFromDate:[NSDate date]], (long)code, what,
-                      [http valueForHTTPHeaderField:@"Retry-After"] ?: @"(none)", snippet];
+                      [stamp stringFromDate:[NSDate date]], (long)code, RedactHex(what),
+                      [http valueForHTTPHeaderField:@"Retry-After"] ?: @"(none)",
+                      RedactHex(snippet)];
 
     NSString *path = [dir stringByAppendingPathComponent:@"failures.log"];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -947,8 +1167,8 @@ static void LogFailure(NSInteger code, NSHTTPURLResponse *http, NSData *body, NS
     BOOL                  _serverAsked;  // the wait came from Retry-After, not us
     BOOL                  _authExpired;  // 401 seen; polling on is pointless and harmful
     BOOL                  _fromClaudeCode;  // showing Claude Code's cache, not ours
-    NSDate               *_deadTokenExpiry;  // expiry of the token that failed auth
-    NSDate               *_sentTokenExpiry;  // expiry of the token now in flight
+    Credentials          *_creds;             // what the current chain is using
+    BOOL                  _renewedThisCycle;  // one renewal per chain, then stop
     NSDate               *_lastTransientLog; // rate limits our own logging
 }
 
@@ -1140,56 +1360,64 @@ static BOOL IsTransientNetworkError(NSError *error) {
         return;
     }
 
-    // Heal without being asked.
-    //
-    // Claude Code rewrites this token every time it runs, so the repair for an
-    // expired token is something the user does for their own reasons and should
-    // not have to tell us about. Re-read the keychain — local, no network — and
-    // resume the moment it holds a *different* token.
-    //
-    // Different, not merely valid: if the same token keeps failing, the problem
-    // is not staleness but revocation or the wrong account, and retrying would
-    // rebuild exactly the pile of 401s that earns an hour-long 429.
-    if (_authExpired) {
-        OAuthToken *current = ReadOAuthToken();
-        BOOL renewed = current.value.length > 0 && ![current isExpired] &&
-                       current.expires != nil &&
-                       ![current.expires isEqualToDate:_deadTokenExpiry];
-        if (!renewed && !forced) {
-            [self renderState:UsageStateExpired limits:@[] message:nil];
-            return;
-        }
-        _authExpired = NO;
-    }
     if (!forced && _lastSuccess && [now timeIntervalSinceDate:_lastSuccess] < kFreshnessWindow) {
         return;  // recent enough — leave the UI as it is, make no request
     }
 
-    OAuthToken *token = ReadOAuthToken();
-    if (token.value.length == 0) {
+    Credentials *creds = ReadCredentials();
+    if (creds.accessToken.length == 0) {
         [self renderState:UsageStateNoCredentials limits:@[] message:nil];
         return;
     }
+    _creds = creds;
+    _renewedThisCycle = NO;
 
-    // The whole point of reading expiresAt: refuse to spend a request we can
-    // already prove will fail. Every 401 this avoids is one that can't be
-    // counted toward a 429, and the 429 is the expensive part — a flat hour,
-    // regardless of how the failures were earned. Costs one local keychain
-    // read; saves the lockout entirely.
-    if (token.isExpired) {
-        _authExpired     = YES;
-        _deadTokenExpiry = token.expires;
-        [self renderState:UsageStateExpired limits:@[] message:nil];
+    // An expired access token is renewed here, never sent. The usage endpoint
+    // answers a dead token with a 401, and enough of those with a flat
+    // one-hour 429 — so the only place an expired token ever goes is the token
+    // endpoint, in exchange for a live one.
+    if (creds.isExpired) {
+        if (!creds.refreshToken) {
+            [self renderState:UsageStateExpired limits:@[] message:@"no refresh token stored"];
+            return;
+        }
+        // A renewal that already failed for this exact stored token is not
+        // retried on the timer; that would turn one dead refresh token into a
+        // stream of pointless calls. The Refresh button retries once, by hand.
+        if (!forced && [self renewalAlreadyFailedFor:creds]) {
+            [self renderState:UsageStateExpired limits:@[] message:nil];
+            return;
+        }
+        [self markInFlight:YES];
+        _renewedThisCycle = YES;
+        __weak AppDelegate *weakSelf = self;
+        [self renewCredentials:creds then:^(Credentials *fresh, NSString *failure, BOOL transient) {
+            AppDelegate *strong = weakSelf;
+            if (!strong) return;
+            if (fresh) {
+                strong->_creds = fresh;
+                [strong continueWithCredentials:fresh];
+                return;
+            }
+            [strong markInFlight:NO];
+            if (transient) { [strong renderDegradedWithNote:[strong offlineNote]]; return; }
+            [strong rememberRenewalFailedFor:creds];
+            [strong renderState:UsageStateExpired limits:@[] message:failure];
+        }];
         return;
     }
-    _authExpired     = NO;   // a fresh token means the last failure is behind us
-    _sentTokenExpiry = token.expires;
 
     [self markInFlight:YES];
+    [self continueWithCredentials:creds];
+}
 
+/// The profile hop (once per machine, for the plan name) and then the usage
+/// fetch. Split out so a freshly renewed token enters the same path.
+- (void)continueWithCredentials:(Credentials *)creds {
+    NSString *token = creds.accessToken;
     __weak AppDelegate *weakSelf = self;
     if (_planName.length == 0) {
-        [self request:kProfileURL token:token.value done:^(NSInteger code, NSData *data,
+        [self request:kProfileURL token:token done:^(NSInteger code, NSData *data,
                                                      NSError *error, NSHTTPURLResponse *http) {
             AppDelegate *strong = weakSelf;
             if (!strong) return;
@@ -1216,10 +1444,10 @@ static BOOL IsTransientNetworkError(NSError *error) {
                     }
                 }
             }
-            [strong fetchUsageWithToken:token.value];
+            [strong fetchUsageWithToken:token];
         }];
     } else {
-        [self fetchUsageWithToken:token.value];
+        [self fetchUsageWithToken:token];
     }
 }
 
@@ -1251,9 +1479,30 @@ static BOOL IsTransientNetworkError(NSError *error) {
         }
         if (code == 401 || code == 403) {
             LogFailure(code, http, data, @"usage");
-            strong->_authExpired     = YES;
-            // Remember which token died, so a later one is recognised as new.
-            strong->_deadTokenExpiry = strong->_sentTokenExpiry;
+            // A token we believed valid was refused. One renewal, then stop: a
+            // second refusal means revoked, not stale, and retrying would just
+            // rebuild the pile of 401s that earns an hour-long 429.
+            Credentials *creds = strong->_creds;
+            if (!strong->_renewedThisCycle && creds.refreshToken) {
+                strong->_renewedThisCycle = YES;
+                [strong markInFlight:YES];
+                [strong renewCredentials:creds
+                                    then:^(Credentials *fresh, NSString *failure, BOOL transient) {
+                    AppDelegate *again = weakSelf;
+                    if (!again) return;
+                    if (fresh) {
+                        again->_creds = fresh;
+                        [again fetchUsageWithToken:fresh.accessToken];
+                        return;
+                    }
+                    [again markInFlight:NO];
+                    if (transient) { [again renderDegradedWithNote:[again offlineNote]]; return; }
+                    [again rememberRenewalFailedFor:creds];
+                    [again renderState:UsageStateExpired limits:@[] message:failure];
+                }];
+                return;
+            }
+            [strong rememberRenewalFailedFor:creds];
             [strong renderState:UsageStateExpired limits:@[] message:nil];
             return;
         }
@@ -1289,14 +1538,137 @@ static BOOL IsTransientNetworkError(NSError *error) {
 
         strong->_backoff     = 0;
         strong->_nextAllowed = nil;
-        strong->_authExpired    = NO;
         strong->_fromClaudeCode = NO;
+        [strong clearRenewalFailure];
         [strong rememberCooldown];
         strong->_lastSuccess = [NSDate date];
         strong->_dataAsOf    = strong->_lastSuccess;
         strong->_lastLimits  = limits;
         [strong renderState:UsageStateOK limits:limits message:nil];
     }];
+}
+
+#pragma mark Token renewal
+
+/// POST JSON. Completion lands on the main thread like every other request.
+- (void)postJSON:(NSDictionary *)body
+              to:(NSString *)urlString
+            done:(void (^)(NSInteger code, NSData *data, NSError *error,
+                           NSHTTPURLResponse *http))done {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 30;
+    req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"ClaudeUsageBar/1.0" forHTTPHeaderField:@"User-Agent"];
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:NULL];
+
+    NSURLSessionDataTask *task =
+        [[self session] dataTaskWithRequest:req
+                          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]]
+                                ? (NSHTTPURLResponse *)response : nil;
+        NSInteger code = http ? http.statusCode : 0;
+        dispatch_async(dispatch_get_main_queue(), ^{ done(code, data, error, http); });
+    }];
+    [task resume];
+}
+
+/// Renew the access token with the refresh token and store the result where
+/// Claude Code will find it. This mirrors Claude Code's own refresh exactly —
+/// same endpoint, same client id, same body, same merge into the same keychain
+/// item with the same encoding. That symmetry is the whole safety argument for
+/// touching a credential two apps share.
+///
+/// Before the write, the item as it stood is copied to a second keychain entry
+/// (kBackupService), so a bad write is one `security` command from undone.
+/// A failed write is reported, not fatal: the renewed token still works for
+/// this session, and Claude Code renews its own copy the next time it runs.
+- (void)renewCredentials:(Credentials *)creds
+                    then:(void (^)(Credentials *fresh, NSString *failure, BOOL transient))done {
+    NSDictionary *body = @{ @"grant_type":    @"refresh_token",
+                            @"refresh_token": creds.refreshToken,
+                            @"client_id":     kClientID,
+                            @"scope":         creds.scope ?: kDefaultScope };
+
+    __weak AppDelegate *weakSelf = self;
+    [self postJSON:body to:kTokenURL done:^(NSInteger code, NSData *data,
+                                            NSError *error, NSHTTPURLResponse *http) {
+        AppDelegate *strong = weakSelf;
+        if (!strong) return;
+
+        if (error) {
+            LogFailure(0, http, nil, [@"renew: " stringByAppendingString:error.localizedDescription]);
+            done(nil, error.localizedDescription, IsTransientNetworkError(error));
+            return;
+        }
+        if (code == 429 || code >= 500) {
+            LogFailure(code, http, data, @"renew");
+            done(nil, [NSString stringWithFormat:@"token endpoint returned HTTP %ld", (long)code], YES);
+            return;
+        }
+        id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+        NSDictionary *resp = [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+        if (code != 200 || !resp) {
+            // invalid_grant and friends: the refresh token itself is dead.
+            LogFailure(code, http, data, @"renew");
+            NSString *why = [resp[@"error"] isKindOfClass:[NSString class]]
+                          ? resp[@"error"] : [NSString stringWithFormat:@"HTTP %ld", (long)code];
+            done(nil, why, NO);
+            return;
+        }
+
+        NSDictionary *merged = MergeRefreshResponse(creds.blob, resp, [NSDate date]);
+        NSString *json = merged ? JSONText(merged) : nil;
+        Credentials *fresh = json ? CredentialsFromJSONText(json) : nil;
+        if (!fresh || fresh.isExpired) {
+            LogFailure(code, http, data, @"renew: unusable token response");
+            done(nil, @"unusable token response", NO);
+            return;
+        }
+        fresh.service = creds.service;
+        fresh.account = creds.account;
+
+        if (creds.service && creds.account) {
+            NSString *previous = JSONText(creds.blob);
+            if (previous) WriteKeychainItem(kBackupService, creds.account, previous, NULL);
+            NSString *why = nil;
+            if (!WriteKeychainItem(creds.service, creds.account, json, &why)) {
+                LogFailure(0, nil, nil, [@"renew: keychain write failed: "
+                                         stringByAppendingString:why ?: @"?"]);
+            }
+        } else {
+            NSString *path = [@"~/.claude/.credentials.json" stringByExpandingTildeInPath];
+            NSError *werr = nil;
+            [json writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&werr];
+            [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0600}
+                                             ofItemAtPath:path error:NULL];
+            if (werr) LogFailure(0, nil, nil, [@"renew: file write failed: "
+                                               stringByAppendingString:werr.localizedDescription]);
+        }
+        done(fresh, nil, NO);
+    }];
+}
+
+/// Keyed by the stored token's expiry — no secret material — which changes the
+/// moment the user signs in again, so a fresh sign-in is always retried.
+- (BOOL)renewalAlreadyFailedFor:(Credentials *)creds {
+    double failedFor = [[NSUserDefaults standardUserDefaults] doubleForKey:@"RenewalFailedForExpiry"];
+    return failedFor > 0 && creds.expires &&
+           fabs([creds.expires timeIntervalSince1970] - failedFor) < 1.0;
+}
+
+- (void)rememberRenewalFailedFor:(Credentials *)creds {
+    _authExpired = YES;
+    if (creds.expires) {
+        [[NSUserDefaults standardUserDefaults] setDouble:[creds.expires timeIntervalSince1970]
+                                                  forKey:@"RenewalFailedForExpiry"];
+    }
+}
+
+- (void)clearRenewalFailure {
+    _authExpired = NO;
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"RenewalFailedForExpiry"];
 }
 
 /// Honour the server's own cooldown when it sends one, otherwise climb the
@@ -1500,7 +1872,7 @@ static BOOL IsTransientNetworkError(NSError *error) {
             button.toolTip = @"Loading Claude usage…";
         } else if (state == UsageStateExpired) {
             [self applyButton:GaugeImage(nil, nil) title:@"!" tone:[NSColor systemRedColor]];
-            button.toolTip = @"Claude token expired — run `claude` in Terminal once";
+            button.toolTip = @"Claude sign-in expired and couldn't be renewed — click for a one-click fix";
         } else {
             [self applyButton:GaugeImage(nil, nil) title:@"—" tone:[NSColor labelColor]];
             button.toolTip = @"Claude usage unavailable — click for details";
